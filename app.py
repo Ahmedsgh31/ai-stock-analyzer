@@ -1,4 +1,5 @@
 import time
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -118,40 +119,113 @@ def make_line_chart(series: pd.Series, title: str, y_format: str = "money"):
 
 
 # =============================
-# Cached fetchers
+# Shared HTTP session (helps on Streamlit Cloud)
+# =============================
+@st.cache_resource
+def get_http_session():
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0 Safari/537.36"
+            )
+        }
+    )
+    return s
+
+
+# =============================
+# Cached fetchers (more robust on Streamlit Cloud)
 # =============================
 @st.cache_data(ttl=600)
 def fetch_price_history(symbol: str, period: str) -> pd.DataFrame:
-    return yf.download(
-        symbol,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
+    session = get_http_session()
+
+    def _get():
+        t = yf.Ticker(symbol, session=session)
+
+        # Preferred: Ticker.history (often more reliable on cloud)
+        df = t.history(
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            raise_errors=True,
+        )
+
+        # If empty, fallback to yf.download
+        if df is None or df.empty:
+            try:
+                df = yf.download(
+                    symbol,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    threads=False,
+                )
+            except Exception:
+                pass
+
+        return df
+
+    # Exponential backoff retry
+    last = None
+    for i in range(4):
+        try:
+            df = _get()
+            if df is not None and not df.empty:
+                return df
+            last = RuntimeError("Empty price history")
+        except Exception as e:
+            last = e
+        time.sleep(1.5 * (2**i))
+
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=600)
 def fetch_fast_info(symbol: str) -> dict:
-    fi = yf.Ticker(symbol).fast_info
-    if fi is None:
-        return {}
+    session = get_http_session()
+
+    def _get():
+        fi = yf.Ticker(symbol, session=session).fast_info
+        if fi is None:
+            return {}
+        try:
+            return dict(fi)  # pickle-safe
+        except Exception:
+            return {}
+
     try:
-        return dict(fi)  # IMPORTANT: FastInfo -> dict (pickle-safe)
+        return _retry(_get, tries=3, sleep_s=1.2)
     except Exception:
         return {}
 
 
 @st.cache_data(ttl=600)
 def fetch_company_info(symbol: str) -> dict:
-    # heavier endpoint, can get rate-limited
-    return yf.Ticker(symbol).info or {}
+    """
+    Heavy endpoint (.info) – can rate limit.
+    Keep optional.
+    """
+    session = get_http_session()
+
+    def _get():
+        return yf.Ticker(symbol, session=session).info or {}
+
+    try:
+        return _retry(_get, tries=2, sleep_s=1.6)
+    except Exception:
+        return {}
 
 
 @st.cache_data(ttl=600)
 def fetch_statements(symbol: str, quarterly: bool):
-    t = yf.Ticker(symbol)
+    session = get_http_session()
+    t = yf.Ticker(symbol, session=session)
 
     def _get_all():
         if quarterly:
@@ -164,7 +238,14 @@ def fetch_statements(symbol: str, quarterly: bool):
             cfs = t.cash_flow
         return _to_period_index(inc), _to_period_index(bal), _to_period_index(cfs)
 
-    return _retry(_get_all, tries=3, sleep_s=1.2)
+    last = None
+    for i in range(4):
+        try:
+            return _get_all()
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (2**i))
+    raise last
 
 
 # =============================
@@ -216,8 +297,8 @@ if search_button and stock_symbol:
         if hist_data is None or hist_data.empty:
             st.error(f"No data returned for '{symbol}'.")
             st.info(
-                "This can happen due to Yahoo Finance rate limits (HTTP 429) or temporary empty responses.\n\n"
-                "✅ Try: wait 1–2 minutes, refresh, change network (hotspot), or use VPN.\n"
+                "This can happen due to Yahoo Finance rate limits (HTTP 429), blocking cloud IPs, or temporary empty responses.\n\n"
+                "✅ Try: wait 1–3 minutes, refresh, reboot app, change network (hotspot), or use VPN.\n"
                 "✅ Keep *Load detailed company info* OFF unless needed."
             )
             st.stop()
@@ -229,6 +310,14 @@ if search_button and stock_symbol:
             except Exception:
                 pass
 
+        # Ensure expected columns exist (some responses can miss Volume etc.)
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in hist_data.columns:
+                st.error(f"Price data missing required column: {col}")
+                st.stop()
+        if "Volume" not in hist_data.columns:
+            hist_data["Volume"] = 0
+
         # Fast info (light)
         fast = fetch_fast_info(symbol)
 
@@ -236,10 +325,7 @@ if search_button and stock_symbol:
         info = {}
         if load_detailed:
             with st.spinner("Loading detailed company info..."):
-                try:
-                    info = fetch_company_info(symbol)
-                except Exception:
-                    info = {}
+                info = fetch_company_info(symbol) or {}
 
         # =============================
         # Header metrics
@@ -426,7 +512,10 @@ if search_button and stock_symbol:
                 # Balance Sheet trends
                 liab_series = series_from_stmt(balance, ["Total Liabilities Net Minority Interest", "Total Liabilities"])
                 assets_series = series_from_stmt(balance, ["Total Assets"])
-                debt_series = series_from_stmt(balance, ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"])
+                debt_series = series_from_stmt(
+                    balance,
+                    ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"],
+                )
 
                 # Cash Flow trends
                 ocf_series = series_from_stmt(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
@@ -438,27 +527,51 @@ if search_button and stock_symbol:
                 # Charts grid
                 r1c1, r1c2 = st.columns(2)
                 with r1c1:
-                    st.plotly_chart(make_line_chart(eps_series, f"EPS Trend ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(eps_series, f"EPS Trend ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
                 with r1c2:
-                    st.plotly_chart(make_line_chart(pm_series, f"Profit Margin Trend ({freq})", y_format="pct"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(pm_series, f"Profit Margin Trend ({freq})", y_format="pct"),
+                        use_container_width=True,
+                    )
 
                 r2c1, r2c2 = st.columns(2)
                 with r2c1:
-                    st.plotly_chart(make_line_chart(rev_series, f"Revenue Trend ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(rev_series, f"Revenue Trend ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
                 with r2c2:
-                    st.plotly_chart(make_line_chart(ni_series, f"Net Income Trend ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(ni_series, f"Net Income Trend ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
 
                 r3c1, r3c2 = st.columns(2)
                 with r3c1:
-                    st.plotly_chart(make_line_chart(liab_series, f"Total Liabilities ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(liab_series, f"Total Liabilities ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
                 with r3c2:
-                    st.plotly_chart(make_line_chart(assets_series, f"Total Assets ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(assets_series, f"Total Assets ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
 
                 r4c1, r4c2 = st.columns(2)
                 with r4c1:
-                    st.plotly_chart(make_line_chart(debt_series, f"Debt Trend ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(debt_series, f"Debt Trend ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
                 with r4c2:
-                    st.plotly_chart(make_line_chart(fcf_series, f"Free Cash Flow ({freq})", y_format="money"), use_container_width=True)
+                    st.plotly_chart(
+                        make_line_chart(fcf_series, f"Free Cash Flow ({freq})", y_format="money"),
+                        use_container_width=True,
+                    )
 
                 if show_table:
                     st.markdown("#### Income Statement (selected lines)")
@@ -487,17 +600,14 @@ if search_button and stock_symbol:
 
             horizon_days = st.slider("Forecast horizon (days)", 7, 90, 30, 1)
 
-            # Prepare close series (ensure Date exists)
             close_df = hist_data.reset_index().copy()
             if "Date" not in close_df.columns:
-                # Sometimes reset_index name differs (e.g., "index")
                 close_df = close_df.rename(columns={"index": "Date"})
             close_df = close_df[["Date", "Close"]].dropna().copy()
 
             if close_df.empty or close_df["Close"].nunique() < 10:
                 st.warning("Not enough historical data to run a forecast.")
             else:
-                # Try Prophet first
                 use_prophet = True
                 try:
                     from prophet import Prophet
@@ -523,7 +633,6 @@ if search_button and stock_symbol:
                         fig.add_trace(go.Scatter(x=dfp["ds"], y=dfp["y"], mode="lines", name="Actual"))
                         fig.add_trace(go.Scatter(x=fcst["ds"], y=fcst["yhat"], mode="lines", name="Forecast"))
 
-                        # Confidence band
                         fig.add_trace(go.Scatter(
                             x=fcst["ds"], y=fcst["yhat_upper"],
                             mode="lines", line=dict(width=0),
