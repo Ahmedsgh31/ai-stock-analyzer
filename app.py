@@ -1,7 +1,10 @@
 import time
-import requests
+from io import StringIO
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
@@ -66,14 +69,14 @@ def _to_period_index(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _retry(fn, tries=3, sleep_s=1.1):
+def _retry(fn, tries=3, sleep_s=1.2):
     last = None
-    for _ in range(tries):
+    for i in range(tries):
         try:
             return fn()
         except Exception as e:
             last = e
-            time.sleep(sleep_s)
+            time.sleep(sleep_s * (1.5**i))
     raise last
 
 
@@ -101,7 +104,6 @@ def make_line_chart(series: pd.Series, title: str, y_format: str = "money"):
         return fig
 
     fig.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines+markers", name=title))
-
     fig.update_layout(
         title=title,
         height=350,
@@ -118,8 +120,21 @@ def make_line_chart(series: pd.Series, title: str, y_format: str = "money"):
     return fig
 
 
+def _period_to_days(period: str) -> int:
+    # Convert common yfinance periods to an approximate day window
+    p = period.lower().strip()
+    if p.endswith("mo"):
+        n = int(p.replace("mo", ""))
+        return n * 31
+    if p.endswith("y"):
+        n = int(p.replace("y", ""))
+        return n * 366
+    # fallback
+    return 400
+
+
 # =============================
-# Shared HTTP session (helps on Streamlit Cloud)
+# HTTP Session
 # =============================
 @st.cache_resource
 def get_http_session():
@@ -137,20 +152,21 @@ def get_http_session():
 
 
 # =============================
-# Cached fetchers (more robust on Streamlit Cloud)
+# Fetchers
 # =============================
-import pandas as pd
-import yfinance as yf
-import streamlit as st
-
 @st.cache_data(ttl=600)
 def fetch_price_history(symbol: str, period: str) -> pd.DataFrame:
-    symbol = symbol.strip().upper()
+    """
+    1) Try yfinance (Yahoo). On Streamlit Cloud Yahoo often rate-limits / blocks -> empty.
+    2) If empty and symbol is US-like, fallback to Stooq.
+    """
+    sym = symbol.strip().upper()
+    session = get_http_session()
 
-    # 1) Try yfinance download
+    # ---- 1) Yahoo via yfinance.download ----
     try:
         df = yf.download(
-            symbol,
+            sym,
             period=period,
             interval="1d",
             auto_adjust=False,
@@ -158,51 +174,60 @@ def fetch_price_history(symbol: str, period: str) -> pd.DataFrame:
             threads=False,
             group_by="column",
         )
-        if df is not None and not df.empty:
+        if isinstance(df, pd.DataFrame) and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             return df
     except Exception:
         pass
 
-    # 2) Try yfinance Ticker().history() (sometimes works when download fails)
+    # ---- 2) Yahoo via Ticker().history ----
     try:
-        df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
-        if df is not None and not df.empty:
-            # history() often returns columns with capitalized names already
+        t = yf.Ticker(sym, session=session)
+        df = t.history(period=period, interval="1d", auto_adjust=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            # history returns index as DatetimeIndex
+            # Ensure standard columns exist
             return df
     except Exception:
         pass
 
-    # 3) Fallback to STOOQ for US stocks only (AAPL -> aapl.us)
-    #    Stooq doesn't reliably support Saudi tickers like 2222.SR
-    if symbol.endswith(".SR"):
-        return pd.DataFrame()  # keep empty -> your existing message will show
+    # ---- 3) Fallback to Stooq (US only) ----
+    # Stooq does NOT reliably support .SR (Saudi)
+    if "." in sym:  # has suffix like .SR
+        return pd.DataFrame()
 
     try:
-        stooq_symbol = symbol.lower()
-        # If user typed AAPL, Stooq expects aapl.us
-        if "." not in stooq_symbol:
-            stooq_symbol = f"{stooq_symbol}.us"
-
+        stooq_symbol = f"{sym.lower()}.us"
         url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-        df = pd.read_csv(url)
-        if df is None or df.empty or "Date" not in df.columns:
+
+        r = session.get(url, timeout=15)
+        if r.status_code != 200 or len(r.text) < 50:
             return pd.DataFrame()
 
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.sort_values("Date").set_index("Date")
+        df2 = pd.read_csv(StringIO(r.text))
+        if df2.empty or "Date" not in df2.columns:
+            return pd.DataFrame()
 
-        # Stooq columns are: Open, High, Low, Close, Volume
-        # Make sure they exist and numeric
+        df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce")
+        df2 = df2.dropna(subset=["Date"]).set_index("Date").sort_index()
+
         for c in ["Open", "High", "Low", "Close", "Volume"]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
+            if c in df2.columns:
+                df2[c] = pd.to_numeric(df2[c], errors="coerce")
 
-        df = df.dropna(subset=["Close"])
-        return df
+        df2 = df2.dropna(subset=["Close"])
+
+        # Slice to requested period
+        days = _period_to_days(period)
+        cutoff = pd.Timestamp(datetime.utcnow() - timedelta(days=days))
+        df2 = df2[df2.index >= cutoff]
+
+        return df2
+
     except Exception:
         return pd.DataFrame()
+
 
 @st.cache_data(ttl=600)
 def fetch_fast_info(symbol: str) -> dict:
@@ -225,10 +250,6 @@ def fetch_fast_info(symbol: str) -> dict:
 
 @st.cache_data(ttl=600)
 def fetch_company_info(symbol: str) -> dict:
-    """
-    Heavy endpoint (.info) – can rate limit.
-    Keep optional.
-    """
     session = get_http_session()
 
     def _get():
@@ -256,14 +277,7 @@ def fetch_statements(symbol: str, quarterly: bool):
             cfs = t.cash_flow
         return _to_period_index(inc), _to_period_index(bal), _to_period_index(cfs)
 
-    last = None
-    for i in range(4):
-        try:
-            return _get_all()
-        except Exception as e:
-            last = e
-            time.sleep(1.5 * (2**i))
-    raise last
+    return _retry(_get_all, tries=3, sleep_s=1.6)
 
 
 # =============================
@@ -274,8 +288,8 @@ with st.sidebar:
 
     stock_symbol = st.text_input(
         "Enter Stock Symbol",
-        placeholder="e.g., AAPL, 2222.SR, TSLA",
-        help="Use Yahoo Finance format. For Saudi stocks add .SR (e.g., 2222.SR for Aramco)",
+        placeholder="e.g., AAPL, TSLA, 2222.SR",
+        help="Use Yahoo Finance format. Saudi stocks add .SR (e.g., 2222.SR).",
     )
 
     period_options = {
@@ -315,31 +329,27 @@ if search_button and stock_symbol:
         if hist_data is None or hist_data.empty:
             st.error(f"No data returned for '{symbol}'.")
             st.info(
-                "This can happen due to Yahoo Finance rate limits (HTTP 429), blocking cloud IPs, or temporary empty responses.\n\n"
-                "✅ Try: wait 1–3 minutes, refresh, reboot app, change network (hotspot), or use VPN.\n"
-                "✅ Keep *Load detailed company info* OFF unless needed."
+                "On Streamlit Cloud, Yahoo Finance often blocks/rate-limits requests.\n\n"
+                "✅ For US tickers (AAPL/TSLA/MSFT) the app auto-falls back to Stooq.\n"
+                "⚠️ For Saudi tickers (.SR) you may still get empty due to Yahoo blocking.\n\n"
+                "Try: wait 1–3 minutes, refresh, reboot app, change network/VPN."
             )
             st.stop()
 
-        # Some yfinance downloads return MultiIndex columns
+        # Normalize columns (in case of weird returns)
         if isinstance(hist_data.columns, pd.MultiIndex):
-            try:
-                hist_data.columns = hist_data.columns.get_level_values(0)
-            except Exception:
-                pass
+            hist_data.columns = hist_data.columns.get_level_values(0)
 
-        # Ensure expected columns exist (some responses can miss Volume etc.)
         for col in ["Open", "High", "Low", "Close"]:
             if col not in hist_data.columns:
                 st.error(f"Price data missing required column: {col}")
                 st.stop()
+
         if "Volume" not in hist_data.columns:
             hist_data["Volume"] = 0
 
-        # Fast info (light)
         fast = fetch_fast_info(symbol)
 
-        # Detailed info (heavy)
         info = {}
         if load_detailed:
             with st.spinner("Loading detailed company info..."):
@@ -368,13 +378,13 @@ if search_button and stock_symbol:
 
         with col3:
             hi_52 = _safe_float(fast.get("yearHigh"))
-            if hi_52 is None and "High" in hist_data:
+            if hi_52 is None:
                 hi_52 = float(hist_data["High"].max())
             st.metric("52W High", f"${hi_52:.2f}" if hi_52 is not None else "N/A")
 
         with col4:
             lo_52 = _safe_float(fast.get("yearLow"))
-            if lo_52 is None and "Low" in hist_data:
+            if lo_52 is None:
                 lo_52 = float(hist_data["Low"].min())
             st.metric("52W Low", f"${lo_52:.2f}" if lo_52 is not None else "N/A")
 
@@ -383,7 +393,7 @@ if search_button and stock_symbol:
         tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "🔮 AI Forecast"])
 
         # =============================
-        # TAB 1: Price analysis
+        # TAB 1
         # =============================
         with tab1:
             st.subheader("Historical Price Trend")
@@ -444,12 +454,11 @@ if search_button and stock_symbol:
                 st.write("Low:", f"${pl:.2f}")
 
         # =============================
-        # TAB 2: Financial Metrics + Trends
+        # TAB 2
         # =============================
         with tab2:
             st.subheader("Company Financial Position")
 
-            # Snapshot metrics
             snap1, snap2 = st.columns(2)
 
             market_cap = _safe_float((info or {}).get("marketCap")) or _safe_float(fast.get("marketCap"))
@@ -493,7 +502,7 @@ if search_button and stock_symbol:
                     st.write(info["longBusinessSummary"])
 
             st.markdown("---")
-            st.subheader("📈 Fundamentals Trends (EPS, Margin, Liabilities, Debt, etc.)")
+            st.subheader("📈 Fundamentals Trends (Yahoo Statements)")
 
             tc1, tc2, tc3 = st.columns([1, 1, 2])
             with tc1:
@@ -501,9 +510,7 @@ if search_button and stock_symbol:
             with tc2:
                 show_table = st.checkbox("Show statements table", value=False)
             with tc3:
-                st.caption(
-                    "Uses Yahoo financial statements. If you see empty/N/A, wait 1–2 minutes and retry (rate-limit)."
-                )
+                st.caption("If statements are empty, Yahoo may be blocking Streamlit Cloud. Try later / VPN.")
 
             quarterly = (freq == "Quarterly")
 
@@ -512,106 +519,70 @@ if search_button and stock_symbol:
                     income, balance, cashflow = fetch_statements(symbol, quarterly=quarterly)
 
                 if (income is None or income.empty) and (balance is None or balance.empty):
-                    st.warning("No fundamentals returned (rate-limit/empty response). Try again in 1–2 minutes.")
+                    st.warning("No fundamentals returned. Likely Yahoo blocked. Try again later.")
                     st.stop()
 
-                # EPS
                 eps_series = series_from_stmt(income, ["Diluted EPS", "Basic EPS", "Earnings Per Share"])
-
-                # Revenue & Net Income
                 rev_series = series_from_stmt(income, ["Total Revenue", "Revenue"])
                 ni_series = series_from_stmt(income, ["Net Income", "Net Income Common Stockholders"])
 
-                # Profit margin = Net Income / Revenue
                 pm_series = pd.Series(dtype=float)
                 if not rev_series.empty and not ni_series.empty:
                     pm_series = (ni_series / rev_series).replace([np.inf, -np.inf], np.nan).dropna()
 
-                # Balance Sheet trends
                 liab_series = series_from_stmt(balance, ["Total Liabilities Net Minority Interest", "Total Liabilities"])
                 assets_series = series_from_stmt(balance, ["Total Assets"])
                 debt_series = series_from_stmt(
-                    balance,
-                    ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"],
+                    balance, ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"]
                 )
 
-                # Cash Flow trends
                 ocf_series = series_from_stmt(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
                 capex_series = series_from_stmt(cashflow, ["Capital Expenditure", "Capital Expenditures"])
                 fcf_series = pd.Series(dtype=float)
                 if not ocf_series.empty and not capex_series.empty:
                     fcf_series = (ocf_series + capex_series).dropna()
 
-                # Charts grid
                 r1c1, r1c2 = st.columns(2)
                 with r1c1:
-                    st.plotly_chart(
-                        make_line_chart(eps_series, f"EPS Trend ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(eps_series, f"EPS Trend ({freq})", "money"), use_container_width=True)
                 with r1c2:
-                    st.plotly_chart(
-                        make_line_chart(pm_series, f"Profit Margin Trend ({freq})", y_format="pct"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(pm_series, f"Profit Margin Trend ({freq})", "pct"), use_container_width=True)
 
                 r2c1, r2c2 = st.columns(2)
                 with r2c1:
-                    st.plotly_chart(
-                        make_line_chart(rev_series, f"Revenue Trend ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(rev_series, f"Revenue Trend ({freq})", "money"), use_container_width=True)
                 with r2c2:
-                    st.plotly_chart(
-                        make_line_chart(ni_series, f"Net Income Trend ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(ni_series, f"Net Income Trend ({freq})", "money"), use_container_width=True)
 
                 r3c1, r3c2 = st.columns(2)
                 with r3c1:
-                    st.plotly_chart(
-                        make_line_chart(liab_series, f"Total Liabilities ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(liab_series, f"Total Liabilities ({freq})", "money"), use_container_width=True)
                 with r3c2:
-                    st.plotly_chart(
-                        make_line_chart(assets_series, f"Total Assets ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(assets_series, f"Total Assets ({freq})", "money"), use_container_width=True)
 
                 r4c1, r4c2 = st.columns(2)
                 with r4c1:
-                    st.plotly_chart(
-                        make_line_chart(debt_series, f"Debt Trend ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(debt_series, f"Debt Trend ({freq})", "money"), use_container_width=True)
                 with r4c2:
-                    st.plotly_chart(
-                        make_line_chart(fcf_series, f"Free Cash Flow ({freq})", y_format="money"),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(make_line_chart(fcf_series, f"Free Cash Flow ({freq})", "money"), use_container_width=True)
 
                 if show_table:
                     st.markdown("#### Income Statement (selected lines)")
-                    top_income = pd.DataFrame()
                     if income is not None and not income.empty:
                         keep = [i for i in ["Total Revenue", "Net Income", "Diluted EPS", "Basic EPS"] if i in income.index]
-                        top_income = income.loc[keep] if keep else pd.DataFrame()
-                    st.dataframe(top_income, use_container_width=True)
+                        st.dataframe(income.loc[keep] if keep else pd.DataFrame(), use_container_width=True)
 
                     st.markdown("#### Balance Sheet (selected lines)")
-                    top_bal = pd.DataFrame()
                     if balance is not None and not balance.empty:
                         keep = [i for i in ["Total Assets", "Total Liabilities", "Total Debt", "Cash And Cash Equivalents"] if i in balance.index]
-                        top_bal = balance.loc[keep] if keep else pd.DataFrame()
-                    st.dataframe(top_bal, use_container_width=True)
+                        st.dataframe(balance.loc[keep] if keep else pd.DataFrame(), use_container_width=True)
 
             except Exception as e:
                 st.error(f"Could not load fundamentals: {e}")
-                st.info("If you see this often, wait 1–2 minutes and retry (Yahoo rate limits).")
+                st.info("Likely Yahoo blocked/rate-limited. Try later / VPN.")
 
         # =============================
-        # TAB 3: AI Forecast
+        # TAB 3
         # =============================
         with tab3:
             st.subheader("🔮 AI-Powered Price Forecast")
@@ -678,7 +649,7 @@ if search_button and stock_symbol:
                         st.dataframe(future_only.tail(min(30, len(future_only))), use_container_width=True)
 
                     except Exception as e:
-                        st.warning("Prophet failed on this run. Falling back to a simple forecast.")
+                        st.warning("Prophet failed. Falling back to simple trend.")
                         st.caption(f"Prophet error: {e}")
                         use_prophet = False
 
@@ -716,14 +687,13 @@ if search_button and stock_symbol:
 
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
-        st.info("If you see rate-limit issues, wait 1–2 minutes and try again (or change network/VPN).")
+        st.info("Try reboot / refresh / VPN if Yahoo blocks the server.")
 
 elif search_button:
     st.warning("⚠️ Please enter a stock symbol to analyze.")
 
 else:
     st.info("👈 Enter a stock symbol in the sidebar to get started!")
-
     st.markdown(
         """
 ### 🎯 Features:
@@ -732,12 +702,11 @@ else:
 - **Fundamentals trends** (EPS, profit margin, liabilities, assets, debt, free cash flow)
 - **AI forecast** (Prophet if available, otherwise trend fallback)
 
-### 🌍 Supported Markets:
-- **US Stocks:** AAPL, TSLA, MSFT, GOOGL, etc.
-- **Saudi Market:** 2222.SR (Aramco), 1120.SR (Al Rajhi Bank), etc.
-- **Other Markets:** Use Yahoo Finance ticker format
+### 🌍 Notes:
+- US tickers (AAPL/TSLA/…) will auto-fallback to **Stooq** if Yahoo blocks Streamlit Cloud.
+- Saudi tickers (.SR) depend on Yahoo — may require VPN or adding a paid/free market API.
 """
     )
 
 st.markdown("---")
-st.caption("⚠️ Disclaimer: This tool is for educational purposes only. Not financial advice. Always do your own research before investing.")
+st.caption("⚠️ Disclaimer: This tool is for educational purposes only. Not financial advice.")
