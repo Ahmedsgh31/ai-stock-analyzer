@@ -139,52 +139,70 @@ def get_http_session():
 # =============================
 # Cached fetchers (more robust on Streamlit Cloud)
 # =============================
+import pandas as pd
+import yfinance as yf
+import streamlit as st
+
 @st.cache_data(ttl=600)
 def fetch_price_history(symbol: str, period: str) -> pd.DataFrame:
-    session = get_http_session()
+    symbol = symbol.strip().upper()
 
-    def _get():
-        t = yf.Ticker(symbol, session=session)
-
-        # Preferred: Ticker.history (often more reliable on cloud)
-        df = t.history(
+    # 1) Try yfinance download
+    try:
+        df = yf.download(
+            symbol,
             period=period,
             interval="1d",
             auto_adjust=False,
-            actions=False,
-            raise_errors=True,
+            progress=False,
+            threads=False,
+            group_by="column",
         )
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+    except Exception:
+        pass
 
-        # If empty, fallback to yf.download
-        if df is None or df.empty:
-            try:
-                df = yf.download(
-                    symbol,
-                    period=period,
-                    interval="1d",
-                    auto_adjust=False,
-                    progress=False,
-                    threads=False,
-                )
-            except Exception:
-                pass
+    # 2) Try yfinance Ticker().history() (sometimes works when download fails)
+    try:
+        df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=False)
+        if df is not None and not df.empty:
+            # history() often returns columns with capitalized names already
+            return df
+    except Exception:
+        pass
 
+    # 3) Fallback to STOOQ for US stocks only (AAPL -> aapl.us)
+    #    Stooq doesn't reliably support Saudi tickers like 2222.SR
+    if symbol.endswith(".SR"):
+        return pd.DataFrame()  # keep empty -> your existing message will show
+
+    try:
+        stooq_symbol = symbol.lower()
+        # If user typed AAPL, Stooq expects aapl.us
+        if "." not in stooq_symbol:
+            stooq_symbol = f"{stooq_symbol}.us"
+
+        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
+        df = pd.read_csv(url)
+        if df is None or df.empty or "Date" not in df.columns:
+            return pd.DataFrame()
+
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").set_index("Date")
+
+        # Stooq columns are: Open, High, Low, Close, Volume
+        # Make sure they exist and numeric
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        df = df.dropna(subset=["Close"])
         return df
-
-    # Exponential backoff retry
-    last = None
-    for i in range(4):
-        try:
-            df = _get()
-            if df is not None and not df.empty:
-                return df
-            last = RuntimeError("Empty price history")
-        except Exception as e:
-            last = e
-        time.sleep(1.5 * (2**i))
-
-    return pd.DataFrame()
-
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=600)
 def fetch_fast_info(symbol: str) -> dict:
