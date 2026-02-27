@@ -1,10 +1,8 @@
+import os
 import time
-from io import StringIO
-from datetime import datetime, timedelta
-
+import requests
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
@@ -20,6 +18,16 @@ st.set_page_config(
 
 st.title("📈 AI-Powered Stock Market Analyzer")
 st.markdown("---")
+
+# =============================
+# Config / Secrets
+# =============================
+TD_KEY = ""
+try:
+    TD_KEY = st.secrets.get("TWELVEDATA_API_KEY", "")
+except Exception:
+    TD_KEY = ""
+TD_KEY = TD_KEY or os.getenv("TWELVEDATA_API_KEY", "")
 
 # =============================
 # Helpers
@@ -71,12 +79,12 @@ def _to_period_index(df: pd.DataFrame) -> pd.DataFrame:
 
 def _retry(fn, tries=3, sleep_s=1.2):
     last = None
-    for i in range(tries):
+    for _ in range(tries):
         try:
             return fn()
         except Exception as e:
             last = e
-            time.sleep(sleep_s * (1.5**i))
+            time.sleep(sleep_s)
     raise last
 
 
@@ -104,6 +112,7 @@ def make_line_chart(series: pd.Series, title: str, y_format: str = "money"):
         return fig
 
     fig.add_trace(go.Scatter(x=series.index, y=series.values, mode="lines+markers", name=title))
+
     fig.update_layout(
         title=title,
         height=350,
@@ -120,22 +129,6 @@ def make_line_chart(series: pd.Series, title: str, y_format: str = "money"):
     return fig
 
 
-def _period_to_days(period: str) -> int:
-    # Convert common yfinance periods to an approximate day window
-    p = period.lower().strip()
-    if p.endswith("mo"):
-        n = int(p.replace("mo", ""))
-        return n * 31
-    if p.endswith("y"):
-        n = int(p.replace("y", ""))
-        return n * 366
-    # fallback
-    return 400
-
-
-# =============================
-# HTTP Session
-# =============================
 @st.cache_resource
 def get_http_session():
     s = requests.Session()
@@ -151,120 +144,134 @@ def get_http_session():
     return s
 
 
-# =============================
-# Fetchers
-# =============================
-@st.cache_data(ttl=600)
-def fetch_price_history(symbol: str, period: str) -> pd.DataFrame:
+def normalize_symbol(user_symbol: str):
     """
-    1) Try yfinance (Yahoo). On Streamlit Cloud Yahoo often rate-limits / blocks -> empty.
-    2) If empty and symbol is US-like, fallback to Stooq.
+    Returns:
+      (symbol_for_provider, mic_code, is_saudi)
+    User can type:
+      - 2222.SR (Saudi) -> ("2222", "XSAU", True)
+      - AAPL -> ("AAPL", None, False)
     """
-    sym = symbol.strip().upper()
-    session = get_http_session()
-
-    # ---- 1) Yahoo via yfinance.download ----
-    try:
-        df = yf.download(
-            sym,
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            group_by="column",
-        )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df
-    except Exception:
-        pass
-
-    # ---- 2) Yahoo via Ticker().history ----
-    try:
-        t = yf.Ticker(sym, session=session)
-        df = t.history(period=period, interval="1d", auto_adjust=False)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            # history returns index as DatetimeIndex
-            # Ensure standard columns exist
-            return df
-    except Exception:
-        pass
-
-    # ---- 3) Fallback to Stooq (US only) ----
-    # Stooq does NOT reliably support .SR (Saudi)
-    if "." in sym:  # has suffix like .SR
-        return pd.DataFrame()
-
-    try:
-        stooq_symbol = f"{sym.lower()}.us"
-        url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i=d"
-
-        r = session.get(url, timeout=15)
-        if r.status_code != 200 or len(r.text) < 50:
-            return pd.DataFrame()
-
-        df2 = pd.read_csv(StringIO(r.text))
-        if df2.empty or "Date" not in df2.columns:
-            return pd.DataFrame()
-
-        df2["Date"] = pd.to_datetime(df2["Date"], errors="coerce")
-        df2 = df2.dropna(subset=["Date"]).set_index("Date").sort_index()
-
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            if c in df2.columns:
-                df2[c] = pd.to_numeric(df2[c], errors="coerce")
-
-        df2 = df2.dropna(subset=["Close"])
-
-        # Slice to requested period
-        days = _period_to_days(period)
-        cutoff = pd.Timestamp(datetime.utcnow() - timedelta(days=days))
-        df2 = df2[df2.index >= cutoff]
-
-        return df2
-
-    except Exception:
-        return pd.DataFrame()
+    s = (user_symbol or "").strip().upper()
+    if s.endswith(".SR"):
+        base = s.replace(".SR", "").strip()
+        # Twelve Data uses MIC code for exchange
+        return base, "XSAU", True
+    return s, None, False
 
 
-@st.cache_data(ttl=600)
-def fetch_fast_info(symbol: str) -> dict:
-    session = get_http_session()
-
-    def _get():
-        fi = yf.Ticker(symbol, session=session).fast_info
-        if fi is None:
-            return {}
-        try:
-            return dict(fi)  # pickle-safe
-        except Exception:
-            return {}
-
-    try:
-        return _retry(_get, tries=3, sleep_s=1.2)
-    except Exception:
+def compute_fast_from_hist(hist: pd.DataFrame) -> dict:
+    if hist is None or hist.empty:
         return {}
+    out = {}
+    try:
+        out["yearHigh"] = float(hist["High"].max())
+        out["yearLow"] = float(hist["Low"].min())
+        out["lastClose"] = float(hist["Close"].dropna().iloc[-1])
+    except Exception:
+        pass
+    return out
+
+
+# =============================
+# Twelve Data fetcher
+# =============================
+@st.cache_data(ttl=600)
+def fetch_price_history_twelvedata(symbol: str, period: str, mic_code: str | None) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV from Twelve Data time_series.
+    period: "1mo","3mo","6mo","1y","2y","5y" -> mapped to outputsize (approx)
+    """
+    if not TD_KEY:
+        return pd.DataFrame()
+
+    output_map = {
+        "1mo": 25,
+        "3mo": 70,
+        "6mo": 140,
+        "1y": 260,
+        "2y": 520,
+        "5y": 1400,
+    }
+    outputsize = output_map.get(period, 260)
+
+    params = {
+        "symbol": symbol,
+        "interval": "1day",
+        "outputsize": str(outputsize),
+        "apikey": TD_KEY,
+        "format": "JSON",
+    }
+    if mic_code:
+        params["mic_code"] = mic_code  # e.g., XSAU for Saudi Exchange
+
+    url = "https://api.twelvedata.com/time_series"
+    session = get_http_session()
+    r = session.get(url, params=params, timeout=25)
+    data = r.json()
+
+    # Error handling
+    if isinstance(data, dict) and data.get("status") == "error":
+        return pd.DataFrame()
+
+    values = (data or {}).get("values", [])
+    if not values:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(values)
+    # Twelve Data returns strings
+    # columns: datetime, open, high, low, close, volume
+    rename = {
+        "datetime": "Date",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    }
+    df = df.rename(columns=rename)
+
+    if "Date" not in df.columns or "Close" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date").set_index("Date")
+
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    return df
+
+
+# =============================
+# yfinance fetcher (US mainly)
+# =============================
+@st.cache_data(ttl=600)
+def fetch_price_history_yfinance(symbol: str, period: str) -> pd.DataFrame:
+    return yf.download(
+        symbol,
+        period=period,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        group_by="column",
+    )
 
 
 @st.cache_data(ttl=600)
 def fetch_company_info(symbol: str) -> dict:
-    session = get_http_session()
-
-    def _get():
-        return yf.Ticker(symbol, session=session).info or {}
-
+    # heavy endpoint; may fail on Streamlit Cloud
     try:
-        return _retry(_get, tries=2, sleep_s=1.6)
+        return yf.Ticker(symbol).info or {}
     except Exception:
         return {}
 
 
 @st.cache_data(ttl=600)
 def fetch_statements(symbol: str, quarterly: bool):
-    session = get_http_session()
-    t = yf.Ticker(symbol, session=session)
+    t = yf.Ticker(symbol)
 
     def _get_all():
         if quarterly:
@@ -277,7 +284,36 @@ def fetch_statements(symbol: str, quarterly: bool):
             cfs = t.cash_flow
         return _to_period_index(inc), _to_period_index(bal), _to_period_index(cfs)
 
-    return _retry(_get_all, tries=3, sleep_s=1.6)
+    return _retry(_get_all, tries=2, sleep_s=1.5)
+
+
+@st.cache_data(ttl=600)
+def fetch_price_history(symbol_user: str, period: str) -> tuple[pd.DataFrame, dict]:
+    """
+    Returns: (hist_df, meta_dict)
+    meta_dict includes:
+      provider: "twelvedata" | "yfinance"
+      mic_code / normalized_symbol
+    """
+    sym, mic, is_saudi = normalize_symbol(symbol_user)
+
+    # Saudi: go Twelve Data first (Yahoo often blocked on Cloud)
+    if is_saudi:
+        df = fetch_price_history_twelvedata(sym, period, mic)
+        return df, {"provider": "twelvedata", "mic_code": mic, "normalized_symbol": sym}
+
+    # Non-Saudi: try yfinance first, fallback to Twelve Data
+    try:
+        df = fetch_price_history_yfinance(sym, period)
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df, {"provider": "yfinance", "mic_code": None, "normalized_symbol": sym}
+    except Exception:
+        pass
+
+    df = fetch_price_history_twelvedata(sym, period, None)
+    return df, {"provider": "twelvedata", "mic_code": None, "normalized_symbol": sym}
 
 
 # =============================
@@ -288,8 +324,8 @@ with st.sidebar:
 
     stock_symbol = st.text_input(
         "Enter Stock Symbol",
-        placeholder="e.g., AAPL, TSLA, 2222.SR",
-        help="Use Yahoo Finance format. Saudi stocks add .SR (e.g., 2222.SR).",
+        placeholder="e.g., AAPL, 2222.SR, TSLA",
+        help="US: AAPL / TSLA. Saudi: add .SR مثل 2222.SR",
     )
 
     period_options = {
@@ -310,7 +346,7 @@ with st.sidebar:
     load_detailed = st.checkbox(
         "Load detailed company info (may hit Yahoo limits)",
         value=False,
-        help="Uses the heavy .info endpoint which can be rate-limited. Turn ON only when needed.",
+        help="Uses yfinance .info (Yahoo) which can be blocked/rate-limited on Streamlit Cloud.",
     )
 
     search_button = st.button("🔍 Analyze Stock", type="primary", use_container_width=True)
@@ -320,40 +356,44 @@ with st.sidebar:
 # Main
 # =============================
 if search_button and stock_symbol:
-    symbol = stock_symbol.strip().upper()
+    user_symbol = stock_symbol.strip().upper()
 
     try:
-        with st.spinner(f"Fetching price data for {symbol}..."):
-            hist_data = fetch_price_history(symbol, period_options[selected_period])
+        with st.spinner(f"Fetching price data for {user_symbol}..."):
+            hist_data, meta = fetch_price_history(user_symbol, period_options[selected_period])
 
         if hist_data is None or hist_data.empty:
-            st.error(f"No data returned for '{symbol}'.")
+            st.error(f"No data returned for '{user_symbol}'.")
+            if user_symbol.endswith(".SR") and not TD_KEY:
+                st.warning("Saudi (.SR) يحتاج TWELVEDATA_API_KEY في Secrets.")
             st.info(
-                "On Streamlit Cloud, Yahoo Finance often blocks/rate-limits requests.\n\n"
-                "✅ For US tickers (AAPL/TSLA/MSFT) the app auto-falls back to Stooq.\n"
-                "⚠️ For Saudi tickers (.SR) you may still get empty due to Yahoo blocking.\n\n"
-                "Try: wait 1–3 minutes, refresh, reboot app, change network/VPN."
+                "Probable causes:\n"
+                "- Yahoo blocked / rate-limited on Streamlit Cloud\n"
+                "- Missing Twelve Data API key (for .SR)\n\n"
+                "✅ Fix:\n"
+                "1) Add Twelve Data API key in Streamlit Secrets\n"
+                "2) Reboot app\n"
             )
             st.stop()
 
-        # Normalize columns (in case of weird returns)
-        if isinstance(hist_data.columns, pd.MultiIndex):
-            hist_data.columns = hist_data.columns.get_level_values(0)
-
+        # Ensure expected columns exist
         for col in ["Open", "High", "Low", "Close"]:
             if col not in hist_data.columns:
                 st.error(f"Price data missing required column: {col}")
                 st.stop()
-
         if "Volume" not in hist_data.columns:
             hist_data["Volume"] = 0
 
-        fast = fetch_fast_info(symbol)
+        # Fast info from hist (provider-agnostic)
+        fast = compute_fast_from_hist(hist_data)
 
+        # Detailed info (still yfinance; optional)
         info = {}
         if load_detailed:
-            with st.spinner("Loading detailed company info..."):
-                info = fetch_company_info(symbol) or {}
+            with st.spinner("Loading detailed company info (Yahoo)..."):
+                # For Saudi .SR: yfinance expects 2222.SR
+                # For Twelve Data normalized symbol is different, so we use original user input.
+                info = fetch_company_info(user_symbol) or {}
 
         # =============================
         # Header metrics
@@ -361,9 +401,9 @@ if search_button and stock_symbol:
         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
         with col1:
-            company_name = (info or {}).get("longName") or symbol
+            company_name = (info or {}).get("longName") or user_symbol
             st.subheader(company_name)
-            st.caption(f"Symbol: {symbol}")
+            st.caption(f"Symbol: {user_symbol}  •  Data: {meta.get('provider','unknown')}")
 
         with col2:
             close = hist_data["Close"].dropna()
@@ -378,14 +418,10 @@ if search_button and stock_symbol:
 
         with col3:
             hi_52 = _safe_float(fast.get("yearHigh"))
-            if hi_52 is None:
-                hi_52 = float(hist_data["High"].max())
             st.metric("52W High", f"${hi_52:.2f}" if hi_52 is not None else "N/A")
 
         with col4:
             lo_52 = _safe_float(fast.get("yearLow"))
-            if lo_52 is None:
-                lo_52 = float(hist_data["Low"].min())
             st.metric("52W Low", f"${lo_52:.2f}" if lo_52 is not None else "N/A")
 
         st.markdown("---")
@@ -393,7 +429,7 @@ if search_button and stock_symbol:
         tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "🔮 AI Forecast"])
 
         # =============================
-        # TAB 1
+        # TAB 1: Price analysis
         # =============================
         with tab1:
             st.subheader("Historical Price Trend")
@@ -420,7 +456,7 @@ if search_button and stock_symbol:
             )
 
             fig.update_layout(
-                title=f"{symbol} Price & Volume",
+                title=f"{user_symbol} Price & Volume",
                 yaxis_title="Price",
                 yaxis2=dict(title="Volume", overlaying="y", side="right"),
                 xaxis_title="Date",
@@ -454,14 +490,15 @@ if search_button and stock_symbol:
                 st.write("Low:", f"${pl:.2f}")
 
         # =============================
-        # TAB 2
+        # TAB 2: Financial Metrics + Trends
         # =============================
         with tab2:
             st.subheader("Company Financial Position")
 
+            # Snapshot metrics (may be N/A if Yahoo info blocked)
             snap1, snap2 = st.columns(2)
 
-            market_cap = _safe_float((info or {}).get("marketCap")) or _safe_float(fast.get("marketCap"))
+            market_cap = _safe_float((info or {}).get("marketCap"))
             pe_ratio = _safe_float((info or {}).get("trailingPE")) or _safe_float((info or {}).get("forwardPE"))
             eps_ttm = _safe_float((info or {}).get("trailingEps"))
             div_yield = _safe_float((info or {}).get("dividendYield"))
@@ -471,38 +508,26 @@ if search_button and stock_symbol:
             revenue = _safe_float((info or {}).get("totalRevenue"))
 
             with snap1:
-                st.markdown("### 📊 Key Metrics")
+                st.markdown("### 📊 Key Metrics (Yahoo)")
                 st.metric("Market Cap", _human_money(market_cap))
                 st.metric("P/E Ratio", f"{pe_ratio:.2f}" if pe_ratio is not None else "N/A")
                 st.metric("EPS (TTM)", f"${eps_ttm:.2f}" if eps_ttm is not None else "N/A")
                 st.metric("Dividend Yield", _human_pct(div_yield))
 
             with snap2:
-                st.markdown("### 💰 Profitability")
+                st.markdown("### 💰 Profitability (Yahoo)")
                 st.metric("ROE", _human_pct(roe))
                 st.metric("ROA", _human_pct(roa))
                 st.metric("Profit Margin", _human_pct(profit_margin))
                 st.metric("Revenue (TTM)", _human_money(revenue))
 
-            st.markdown("---")
-
-            st.markdown("### 📝 Company Information")
-            d1, d2 = st.columns(2)
-            with d1:
-                st.write("**Sector:**", (info or {}).get("sector", "N/A"))
-                st.write("**Industry:**", (info or {}).get("industry", "N/A"))
-                st.write("**Country:**", (info or {}).get("country", "N/A"))
-            with d2:
-                emp = (info or {}).get("fullTimeEmployees")
-                st.write("**Employees:**", f"{emp:,}" if isinstance(emp, int) else "N/A")
-                st.write("**Website:**", (info or {}).get("website", "N/A"))
-
-            if (info or {}).get("longBusinessSummary"):
-                with st.expander("📖 Business Summary"):
-                    st.write(info["longBusinessSummary"])
+            st.info(
+                "ملاحظة: Financial Metrics و Fundamentals هنا تعتمد على Yahoo عبر yfinance.\n"
+                "إذا كانت N/A على Streamlit Cloud فهذا بسبب الحظر/الـ rate limit."
+            )
 
             st.markdown("---")
-            st.subheader("📈 Fundamentals Trends (Yahoo Statements)")
+            st.subheader("📈 Fundamentals Trends (Yahoo)")
 
             tc1, tc2, tc3 = st.columns([1, 1, 2])
             with tc1:
@@ -510,16 +535,16 @@ if search_button and stock_symbol:
             with tc2:
                 show_table = st.checkbox("Show statements table", value=False)
             with tc3:
-                st.caption("If statements are empty, Yahoo may be blocking Streamlit Cloud. Try later / VPN.")
+                st.caption("If empty: Yahoo blocked/rate-limited. Reboot app or try later.")
 
             quarterly = (freq == "Quarterly")
 
             try:
-                with st.spinner("Loading financial statements..."):
-                    income, balance, cashflow = fetch_statements(symbol, quarterly=quarterly)
+                with st.spinner("Loading financial statements (Yahoo)..."):
+                    income, balance, cashflow = fetch_statements(user_symbol, quarterly=quarterly)
 
                 if (income is None or income.empty) and (balance is None or balance.empty):
-                    st.warning("No fundamentals returned. Likely Yahoo blocked. Try again later.")
+                    st.warning("No fundamentals returned (Yahoo blocked/empty).")
                     st.stop()
 
                 eps_series = series_from_stmt(income, ["Diluted EPS", "Basic EPS", "Earnings Per Share"])
@@ -533,7 +558,8 @@ if search_button and stock_symbol:
                 liab_series = series_from_stmt(balance, ["Total Liabilities Net Minority Interest", "Total Liabilities"])
                 assets_series = series_from_stmt(balance, ["Total Assets"])
                 debt_series = series_from_stmt(
-                    balance, ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"]
+                    balance,
+                    ["Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"],
                 )
 
                 ocf_series = series_from_stmt(cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
@@ -568,21 +594,24 @@ if search_button and stock_symbol:
 
                 if show_table:
                     st.markdown("#### Income Statement (selected lines)")
+                    top_income = pd.DataFrame()
                     if income is not None and not income.empty:
                         keep = [i for i in ["Total Revenue", "Net Income", "Diluted EPS", "Basic EPS"] if i in income.index]
-                        st.dataframe(income.loc[keep] if keep else pd.DataFrame(), use_container_width=True)
+                        top_income = income.loc[keep] if keep else pd.DataFrame()
+                    st.dataframe(top_income, use_container_width=True)
 
                     st.markdown("#### Balance Sheet (selected lines)")
+                    top_bal = pd.DataFrame()
                     if balance is not None and not balance.empty:
                         keep = [i for i in ["Total Assets", "Total Liabilities", "Total Debt", "Cash And Cash Equivalents"] if i in balance.index]
-                        st.dataframe(balance.loc[keep] if keep else pd.DataFrame(), use_container_width=True)
+                        top_bal = balance.loc[keep] if keep else pd.DataFrame()
+                    st.dataframe(top_bal, use_container_width=True)
 
             except Exception as e:
-                st.error(f"Could not load fundamentals: {e}")
-                st.info("Likely Yahoo blocked/rate-limited. Try later / VPN.")
+                st.error(f"Could not load fundamentals (Yahoo): {e}")
 
         # =============================
-        # TAB 3
+        # TAB 3: AI Forecast
         # =============================
         with tab3:
             st.subheader("🔮 AI-Powered Price Forecast")
@@ -635,7 +664,7 @@ if search_button and stock_symbol:
                         ))
 
                         fig.update_layout(
-                            title=f"{symbol} Forecast (Next {horizon_days} days)",
+                            title=f"{user_symbol} Forecast (Next {horizon_days} days)",
                             xaxis_title="Date",
                             yaxis_title="Price",
                             height=550,
@@ -649,7 +678,7 @@ if search_button and stock_symbol:
                         st.dataframe(future_only.tail(min(30, len(future_only))), use_container_width=True)
 
                     except Exception as e:
-                        st.warning("Prophet failed. Falling back to simple trend.")
+                        st.warning("Prophet failed. Falling back to a simple trend forecast.")
                         st.caption(f"Prophet error: {e}")
                         use_prophet = False
 
@@ -674,7 +703,7 @@ if search_button and stock_symbol:
                     fig.add_trace(go.Scatter(x=all_dates, y=yhat, mode="lines", name="Forecast (Trend)"))
 
                     fig.update_layout(
-                        title=f"{symbol} Forecast (Trend) - Next {horizon_days} days",
+                        title=f"{user_symbol} Forecast (Trend) - Next {horizon_days} days",
                         xaxis_title="Date",
                         yaxis_title="Price",
                         height=550,
@@ -687,7 +716,6 @@ if search_button and stock_symbol:
 
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
-        st.info("Try reboot / refresh / VPN if Yahoo blocks the server.")
 
 elif search_button:
     st.warning("⚠️ Please enter a stock symbol to analyze.")
@@ -698,13 +726,13 @@ else:
         """
 ### 🎯 Features:
 - **Price charts** (candlestick + volume)
-- **Financial snapshot** (Market cap, P/E, ROE, ROA, Profit margin, Revenue)
-- **Fundamentals trends** (EPS, profit margin, liabilities, assets, debt, free cash flow)
+- **Financial snapshot** (Yahoo - optional)
+- **Fundamentals trends** (Yahoo - may be blocked on cloud)
 - **AI forecast** (Prophet if available, otherwise trend fallback)
 
-### 🌍 Notes:
-- US tickers (AAPL/TSLA/…) will auto-fallback to **Stooq** if Yahoo blocks Streamlit Cloud.
-- Saudi tickers (.SR) depend on Yahoo — may require VPN or adding a paid/free market API.
+### 🇸🇦 تداول (Saudi):
+- اكتب: **2222.SR**, **1120.SR** ...
+- الأسعار تُسحب من Twelve Data (MIC=XSAU) — يحتاج API KEY في Secrets
 """
     )
 
