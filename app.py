@@ -300,63 +300,75 @@ with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
     st.write("Input:", stock_symbol)
     st.write("Resolved object:", resolved)
 
+# Stop if not resolved
 if not resolved:
     st.error(f"Could not find symbol: {user_sym}")
     st.stop()
 
-    symbol = resolved.get("symbol") or user_sym
-    name = resolved.get("instrument_name") or symbol
-    exchange = resolved.get("exchange") or "N/A"
-    currency = resolved.get("currency") or "N/A"
+# Resolve final symbol/info
+symbol = resolved.get("symbol") or user_sym
+name = resolved.get("instrument_name") or symbol
+exchange = resolved.get("exchange") or "N/A"
+currency = resolved.get("currency") or "N/A"
 
-    interval, outputsize = period_options[selected_period]
+# Pick interval/outputsize from your period selector
+interval, outputsize = period_options[selected_period]
 
-    with st.spinner(f"Fetching price data for {symbol}..."):
-        raw_ts = td_get("time_series", {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-    })
+# Fetch price data (and keep raw response for debugging)
+raw_ts = None
+with st.spinner(f"Fetching price data for {symbol}..."):
+    raw_ts = td_get(
+        "time_series",
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize,
+            "format": "JSON",
+        },
+    )
     hist_data = td_time_series(symbol, interval=interval, outputsize=outputsize)
 
 with st.expander("🔧 Debug: time_series raw response", expanded=False):
     st.write(raw_ts)
 
-if hist_data.empty:
+# Stop if no price data
+if hist_data is None or hist_data.empty:
     st.error(f"No price data returned for '{symbol}'.")
     st.info("If this is a Saudi ticker, it depends on Twelve Data coverage/plan for Tadawul.")
     st.stop()
 
-    # Header
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-    with col1:
-        st.subheader(name)
-        st.caption(f"Symbol: {symbol}  |  Exchange: {exchange}  |  Currency: {currency}")
+# =============================
+# Header
+# =============================
+col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
-    close = hist_data["Close"].dropna()
-    with col2:
-        if len(close) >= 2:
-            current_price = float(close.iloc[-1])
-            prev_price = float(close.iloc[-2])
-            delta = current_price - prev_price
-            delta_pct = (delta / prev_price) if prev_price else 0.0
-            st.metric("Current Price", f"{current_price:.2f}", f"{delta:+.2f} ({delta_pct*100:+.2f}%)")
-        else:
-            st.metric("Current Price", "N/A")
+with col1:
+    st.subheader(name)
+    st.caption(f"Symbol: {symbol}  |  Exchange: {exchange}  |  Currency: {currency}")
 
-    with col3:
-        hi = float(hist_data["High"].max())
-        st.metric("Period High", f"{hi:.2f}")
+close = hist_data["Close"].dropna()
 
-    with col4:
-        lo = float(hist_data["Low"].min())
-        st.metric("Period Low", f"{lo:.2f}")
+with col2:
+    if len(close) >= 2:
+        current_price = float(close.iloc[-1])
+        prev_price = float(close.iloc[-2])
+        delta = current_price - prev_price
+        delta_pct = (delta / prev_price) if prev_price else 0.0
+        st.metric("Current Price", f"{current_price:.2f}", f"{delta:+.2f} ({delta_pct*100:+.2f}%)")
+    else:
+        st.metric("Current Price", "N/A")
 
-    st.markdown("---")
+with col3:
+    hi = float(hist_data["High"].max())
+    st.metric("Period High", f"{hi:.2f}")
 
-    tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "🔮 AI Forecast"])
+with col4:
+    lo = float(hist_data["Low"].min())
+    st.metric("Period Low", f"{lo:.2f}")
 
+st.markdown("---")
+
+tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "🔮 AI Forecast"])
     # =============================
     # TAB 1: Price
     # =============================
