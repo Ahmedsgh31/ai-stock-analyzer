@@ -369,64 +369,64 @@ with col4:
 st.markdown("---")
 
 tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "🔮 AI Forecast"])
-    # =============================
-    # TAB 1: Price
-    # =============================
-    with tab1:
-        st.subheader("Historical Price Trend")
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Candlestick(
-                x=hist_data.index,
-                open=hist_data["Open"],
-                high=hist_data["High"],
-                low=hist_data["Low"],
-                close=hist_data["Close"],
-                name="Price",
-            )
+# =============================
+# TAB 1: Price
+# =============================
+with tab1:
+    st.subheader("Historical Price Trend")
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Candlestick(
+            x=hist_data.index,
+            open=hist_data["Open"],
+            high=hist_data["High"],
+            low=hist_data["Low"],
+            close=hist_data["Close"],
+            name="Price",
         )
-        fig.add_trace(
-            go.Bar(
-                x=hist_data.index,
-                y=hist_data["Volume"],
-                name="Volume",
-                yaxis="y2",
-                opacity=0.30,
-            )
+    )
+    fig.add_trace(
+        go.Bar(
+            x=hist_data.index,
+            y=hist_data["Volume"],
+            name="Volume",
+            yaxis="y2",
+            opacity=0.30,
         )
-        fig.update_layout(
-            title=f"{symbol} Price & Volume",
-            yaxis_title="Price",
-            yaxis2=dict(title="Volume", overlaying="y", side="right"),
-            xaxis_title="Date",
-            height=600,
-            hovermode="x unified",
-            template="plotly_dark",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    )
+    fig.update_layout(
+        title=f"{symbol} Price & Volume",
+        yaxis_title="Price",
+        yaxis2=dict(title="Volume", overlaying="y", side="right"),
+        xaxis_title="Date",
+        height=600,
+        hovermode="x unified",
+        template="plotly_dark",
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Technical Indicators")
-        c1, c2, c3 = st.columns(3)
+    st.subheader("Technical Indicators")
+    c1, c2, c3 = st.columns(3)
 
-        with c1:
-            ma_20 = hist_data["Close"].rolling(window=20).mean().iloc[-1]
-            ma_50 = hist_data["Close"].rolling(window=50).mean().iloc[-1]
-            st.markdown("**Moving Averages**")
-            st.write("20-Day MA:", f"{ma_20:.2f}" if not np.isnan(ma_20) else "N/A")
-            st.write("50-Day MA:", f"{ma_50:.2f}" if not np.isnan(ma_50) else "N/A")
+    with c1:
+        ma_20 = hist_data["Close"].rolling(window=20).mean().iloc[-1]
+        ma_50 = hist_data["Close"].rolling(window=50).mean().iloc[-1]
+        st.markdown("**Moving Averages**")
+        st.write("20-Day MA:", f"{ma_20:.2f}" if not np.isnan(ma_20) else "N/A")
+        st.write("50-Day MA:", f"{ma_50:.2f}" if not np.isnan(ma_50) else "N/A")
 
-        with c2:
-            returns = hist_data["Close"].pct_change()
-            vol = returns.std() * np.sqrt(252)
-            st.markdown("**Volatility**")
-            st.write("Annual:", f"{vol*100:.2f}%")
+    with c2:
+        returns = hist_data["Close"].pct_change()
+        vol = returns.std() * np.sqrt(252)
+        st.markdown("**Volatility**")
+        st.write("Annual:", f"{vol*100:.2f}%")
 
-        with c3:
-            st.markdown("**Period Range**")
-            st.write("High:", f"{hist_data['High'].max():.2f}")
-            st.write("Low:", f"{hist_data['Low'].min():.2f}")
-
+    with c3:
+        st.markdown("**Period Range**")
+        st.write("High:", f"{hist_data['High'].max():.2f}")
+        st.write("Low:", f"{hist_data['Low'].min():.2f}")
     # =============================
     # TAB 2: Financial metrics (Twelve Data)
     # =============================
