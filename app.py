@@ -419,7 +419,7 @@ if hist_data.empty:
     # TAB 2: Financial metrics (Twelve Data)
     # =============================
     with tab2:
-    st.subheader("Company Financial Position (Twelve Data)")
+        st.subheader("Company Financial Position (Twelve Data)")
 
     quote = td_quote(symbol)
     stats = td_statistics(symbol)
