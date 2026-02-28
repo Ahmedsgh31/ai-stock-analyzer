@@ -293,11 +293,16 @@ if search_button and stock_symbol:
 
     # Resolve symbol using symbol_search (helps for Saudi / different exchanges)
     with st.spinner("Resolving symbol..."):
-        resolved = td_symbol_search(user_sym)
+    resolved = td_symbol_search(user_sym)
 
-    if not resolved:
-        st.error(f"Could not find symbol: {user_sym}")
-        st.stop()
+# DEBUG: show what Twelve Data found
+with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
+    st.write("Input:", user_sym)
+    st.write("Resolved object:", resolved)
+
+if not resolved:
+    st.error(f"Could not find symbol: {user_sym}")
+    st.stop()
 
     symbol = resolved.get("symbol") or user_sym
     name = resolved.get("instrument_name") or symbol
@@ -307,16 +312,21 @@ if search_button and stock_symbol:
     interval, outputsize = period_options[selected_period]
 
     with st.spinner(f"Fetching price data for {symbol}..."):
-        hist_data = td_time_series(symbol, interval=interval, outputsize=outputsize)
+    raw_ts = td_get("time_series", {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "format": "JSON",
+    })
+    hist_data = td_time_series(symbol, interval=interval, outputsize=outputsize)
 
-    if hist_data.empty:
-        st.error(f"No price data returned for '{symbol}'.")
-        st.info(
-            "If this is a Saudi ticker, it depends on Twelve Data coverage for that instrument.\n\n"
-            "✅ Try searching with the numeric ticker only (e.g., 2222) or keep 2222.SR.\n"
-            "✅ Also confirm your Twelve Data plan includes the market."
-        )
-        st.stop()
+with st.expander("🔧 Debug: time_series raw response", expanded=False):
+    st.write(raw_ts)
+
+if hist_data.empty:
+    st.error(f"No price data returned for '{symbol}'.")
+    st.info("If this is a Saudi ticker, it depends on Twelve Data coverage/plan for Tadawul.")
+    st.stop()
 
     # Header
     col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
@@ -409,57 +419,74 @@ if search_button and stock_symbol:
     # TAB 2: Financial metrics (Twelve Data)
     # =============================
     with tab2:
-        st.subheader("Company Financial Position (Twelve Data)")
+    st.subheader("Company Financial Position (Twelve Data)")
 
-        quote = td_quote(symbol)
-        stats = td_statistics(symbol)
-        prof = td_profile(symbol)
+    quote = td_quote(symbol)
+    stats = td_statistics(symbol)
+    prof = td_profile(symbol)
 
-        # Many fields vary by instrument/coverage/plan. We'll safely read what exists.
-        market_cap = _safe_float(stats.get("market_cap") or quote.get("market_cap"))
-        pe_ratio = _safe_float(stats.get("pe_ratio") or stats.get("pe") or quote.get("pe"))
-        eps_ttm = _safe_float(stats.get("eps") or stats.get("eps_ttm"))
-        div_yield = _safe_float(stats.get("dividend_yield"))
-        roe = _safe_float(stats.get("roe"))
-        roa = _safe_float(stats.get("roa"))
-        profit_margin = _safe_float(stats.get("profit_margin"))
-        revenue = _safe_float(stats.get("revenue_ttm") or stats.get("revenue"))
+    # Debug (important to see if plan blocks endpoints)
+    with st.expander("🔧 Debug: quote / statistics / profile raw", expanded=False):
+        st.write("quote:", quote)
+        st.write("statistics:", stats)
+        st.write("profile:", prof)
 
-        snap1, snap2 = st.columns(2)
-        with snap1:
-            st.markdown("### 📊 Key Metrics")
-            st.metric("Market Cap", _human_money(market_cap))
-            st.metric("P/E Ratio", f"{pe_ratio:.2f}" if pe_ratio is not None else "N/A")
-            st.metric("EPS", f"{eps_ttm:.2f}" if eps_ttm is not None else "N/A")
-            st.metric("Dividend Yield", _human_pct(div_yield))
+    # ---- Quote-based metrics (usually available) ----
+    q_price = _safe_float(quote.get("close") or quote.get("price"))
+    q_change = _safe_float(quote.get("change"))
+    q_change_pct = _safe_float(quote.get("percent_change"))
+    q_volume = _safe_float(quote.get("volume"))
+    q_avg_volume = _safe_float(quote.get("average_volume"))
+    q_high_52 = _safe_float(quote.get("fifty_two_week", {}).get("high") if isinstance(quote.get("fifty_two_week"), dict) else quote.get("fifty_two_week_high"))
+    q_low_52  = _safe_float(quote.get("fifty_two_week", {}).get("low")  if isinstance(quote.get("fifty_two_week"), dict) else quote.get("fifty_two_week_low"))
 
-        with snap2:
-            st.markdown("### 💰 Profitability")
-            st.metric("ROE", _human_pct(roe))
-            st.metric("ROA", _human_pct(roa))
-            st.metric("Profit Margin", _human_pct(profit_margin))
-            st.metric("Revenue", _human_money(revenue))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Last Price", f"{q_price:.2f}" if q_price is not None else "N/A")
+    if q_change is not None and q_change_pct is not None:
+        c2.metric("Change", f"{q_change:+.2f}", f"{q_change_pct:+.2f}%")
+    else:
+        c2.metric("Change", "N/A")
+    c3.metric("Volume", f"{q_volume:,.0f}" if q_volume is not None else "N/A")
+    c4.metric("Avg Volume", f"{q_avg_volume:,.0f}" if q_avg_volume is not None else "N/A")
 
-        st.markdown("---")
-        st.markdown("### 📝 Company Information")
-        d1, d2 = st.columns(2)
+    st.markdown("---")
 
-        with d1:
-            st.write("**Sector:**", prof.get("sector", "N/A"))
-            st.write("**Industry:**", prof.get("industry", "N/A"))
-            st.write("**Country:**", prof.get("country", "N/A"))
+    # ---- Statistics/Profile (optional, may be blocked by plan) ----
+    # If stats/profile are blocked, show a clear note instead of N/A everywhere
+    if (isinstance(stats, dict) and stats.get("status") == "error") or (isinstance(prof, dict) and prof.get("status") == "error"):
+        st.warning("Statistics/Profile may be unavailable on your Twelve Data plan or for this market. Quote metrics above should still work.")
+        # Show any message
+        if isinstance(stats, dict) and stats.get("message"):
+            st.caption(f"Statistics message: {stats.get('message')}")
+        if isinstance(prof, dict) and prof.get("message"):
+            st.caption(f"Profile message: {prof.get('message')}")
+        st.stop()
 
-        with d2:
-            emp = prof.get("employees")
-            st.write("**Employees:**", f"{int(emp):,}" if str(emp).isdigit() else "N/A")
-            st.write("**Website:**", prof.get("website", "N/A"))
+    # Try to read extra fields if present
+    market_cap = _safe_float(stats.get("market_cap"))
+    pe_ratio = _safe_float(stats.get("pe_ratio") or stats.get("pe"))
+    eps = _safe_float(stats.get("eps") or stats.get("eps_ttm"))
+    div_yield = _safe_float(stats.get("dividend_yield"))
 
-        desc = prof.get("description") or prof.get("long_description")
-        if desc:
-            with st.expander("📖 Business Summary"):
-                st.write(desc)
+    s1, s2 = st.columns(2)
+    with s1:
+        st.markdown("### 📊 Extra Metrics (if available)")
+        st.metric("Market Cap", _human_money(market_cap))
+        st.metric("P/E", f"{pe_ratio:.2f}" if pe_ratio is not None else "N/A")
+        st.metric("EPS", f"{eps:.2f}" if eps is not None else "N/A")
+        st.metric("Dividend Yield", _human_pct(div_yield))
 
-        st.info("ملاحظة: بعض الشركات/الأسواق قد لا ترجع كل الحقول حسب تغطية Twelve Data وخطتك.")
+    with s2:
+        st.markdown("### 📝 Company Info (if available)")
+        st.write("Sector:", prof.get("sector", "N/A"))
+        st.write("Industry:", prof.get("industry", "N/A"))
+        st.write("Country:", prof.get("country", "N/A"))
+        st.write("Website:", prof.get("website", "N/A"))
+
+    desc = prof.get("description") or prof.get("long_description")
+    if desc:
+        with st.expander("📖 Business Summary"):
+            st.write(desc)
 
     # =============================
     # TAB 3: Forecast
