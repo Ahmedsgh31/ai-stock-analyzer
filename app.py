@@ -297,7 +297,7 @@ if search_button and stock_symbol:
     
 # DEBUG: show what Twelve Data found
 with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
-    st.write("Input:", user_sym)
+    st.write("Input:", stock_symbol)
     st.write("Resolved object:", resolved)
 
 if not resolved:
