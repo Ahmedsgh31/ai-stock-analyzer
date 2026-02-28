@@ -602,10 +602,16 @@ with tab1:
 
         st.caption("⚠️ Forecasts are experimental and for education only. Not financial advice.")
 
-elif search_button:
+# =============================
+# Bottom state handling
+# =============================
+
+if search_button and not stock_symbol:
     st.warning("⚠️ Please enter a stock symbol to analyze.")
-else:
+
+elif not search_button:
     st.info("👈 Enter a stock symbol in the sidebar to get started!")
+
     st.markdown(
         """
 ### 🎯 Features:
