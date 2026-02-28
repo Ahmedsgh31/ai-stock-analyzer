@@ -293,8 +293,8 @@ if search_button and stock_symbol:
 
     # Resolve symbol using symbol_search (helps for Saudi / different exchanges)
     with st.spinner("Resolving symbol..."):
-    resolved = td_symbol_search(user_sym)
-
+        resolved = td_symbol_search(user_sym)
+    
 # DEBUG: show what Twelve Data found
 with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
     st.write("Input:", user_sym)
@@ -312,7 +312,7 @@ if not resolved:
     interval, outputsize = period_options[selected_period]
 
     with st.spinner(f"Fetching price data for {symbol}..."):
-    raw_ts = td_get("time_series", {
+        raw_ts = td_get("time_series", {
         "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
