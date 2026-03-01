@@ -287,6 +287,7 @@ with st.sidebar:
 # =============================
 if not td_key():
     st.warning("⚠️ Missing TWELVEDATA_API_KEY. Add it in Streamlit → App Settings → Secrets, then reboot the app.")
+    st.stop()
 
 if search_button and stock_symbol:
     user_sym = stock_symbol.strip().upper()
@@ -294,42 +295,50 @@ if search_button and stock_symbol:
     # Resolve symbol using symbol_search (helps for Saudi / different exchanges)
     with st.spinner("Resolving symbol..."):
         resolved = td_symbol_search(user_sym)
-    
-# DEBUG: show what Twelve Data found
-with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
-    st.write("Input:", stock_symbol)
-    st.write("Resolved object:", resolved)
 
-# Stop if not resolved
-if not resolved:
-    st.error(f"Could not find symbol: {user_sym}")
-    st.stop()
+    # DEBUG: show what Twelve Data found (ONLY after resolving)
+    with st.expander("🔧 Debug: Symbol resolution (Twelve Data)", expanded=False):
+        st.write("Input:", user_sym)
+        st.write("Resolved object:", resolved)
 
-# Resolve final symbol/info
-symbol = resolved.get("symbol") or user_sym
-name = resolved.get("instrument_name") or symbol
-exchange = resolved.get("exchange") or "N/A"
-currency = resolved.get("currency") or "N/A"
+    # Stop if not resolved
+    if not resolved:
+        st.error(f"Could not find symbol: {user_sym}")
+        st.stop()
 
-# Pick interval/outputsize from your period selector
-interval, outputsize = period_options[selected_period]
+    # Resolve final symbol/info
+    symbol = resolved.get("symbol") or user_sym
+    name = resolved.get("instrument_name") or symbol
+    exchange = resolved.get("exchange") or "N/A"
+    currency = resolved.get("currency") or "N/A"
 
-# Fetch price data (and keep raw response for debugging)
-raw_ts = None
-with st.spinner(f"Fetching price data for {symbol}..."):
-    raw_ts = td_get(
-        "time_series",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "outputsize": outputsize,
-            "format": "JSON",
-        },
-    )
-    hist_data = td_time_series(symbol, interval=interval, outputsize=outputsize)
+    # Pick interval/outputsize from your period selector
+    interval, outputsize = period_options[selected_period]
 
-with st.expander("🔧 Debug: time_series raw response", expanded=False):
-    st.write(raw_ts)
+    # Fetch price data (and keep raw response for debugging)
+    raw_ts = None
+    with st.spinner(f"Fetching price data for {symbol}..."):
+        raw_ts = td_get(
+            "time_series",
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": outputsize,
+                "format": "JSON",
+            },
+        )
+        hist_data = td_time_series(symbol, interval=interval, outputsize=outputsize)
+
+    with st.expander("🔧 Debug: time_series raw response", expanded=False):
+        st.write(raw_ts)
+
+    if hist_data is None or hist_data.empty:
+        st.error(f"No price data returned for '{symbol}'.")
+        st.info("If this is a Saudi ticker, it depends on Twelve Data coverage/plan for Tadawul.")
+        st.stop()
+
+else:
+    st.info("👈 Enter a stock symbol in the sidebar, then click **Analyze Stock**.")
 
 # Stop if no price data
 if hist_data is None or hist_data.empty:
