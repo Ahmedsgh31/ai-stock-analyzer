@@ -457,27 +457,22 @@ tab1, tab2, tab3 = st.tabs(["📊 Price Analysis", "💼 Financial Metrics", "�
 # =============================
 with tab1:
     st.subheader("Historical Price Trend")
-
     fig = go.Figure()
-    fig.add_trace(
-        go.Candlestick(
-            x=hist_data.index,
-            open=hist_data["Open"],
-            high=hist_data["High"],
-            low=hist_data["Low"],
-            close=hist_data["Close"],
-            name="Price",
-        )
-    )
-    fig.add_trace(
-        go.Bar(
-            x=hist_data.index,
-            y=hist_data["Volume"],
-            name="Volume",
-            yaxis="y2",
-            opacity=0.30,
-        )
-    )
+    fig.add_trace(go.Candlestick(
+        x=hist_data.index,
+        open=hist_data["Open"],
+        high=hist_data["High"],
+        low=hist_data["Low"],
+        close=hist_data["Close"],
+        name="Price",
+    ))
+    fig.add_trace(go.Bar(
+        x=hist_data.index,
+        y=hist_data["Volume"],
+        name="Volume",
+        yaxis="y2",
+        opacity=0.30,
+    ))
     fig.update_layout(
         title=f"{symbol} Price & Volume",
         yaxis_title="Price",
@@ -489,119 +484,37 @@ with tab1:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Technical Indicators")
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        ma_20 = hist_data["Close"].rolling(window=20).mean().iloc[-1]
-        ma_50 = hist_data["Close"].rolling(window=50).mean().iloc[-1]
-        st.markdown("**Moving Averages**")
-        st.write("20-Day MA:", f"{ma_20:.2f}" if not np.isnan(ma_20) else "N/A")
-        st.write("50-Day MA:", f"{ma_50:.2f}" if not np.isnan(ma_50) else "N/A")
-
-    with c2:
-        returns = hist_data["Close"].pct_change()
-        vol = returns.std() * np.sqrt(252)
-        st.markdown("**Volatility**")
-        st.write("Annual:", f"{vol*100:.2f}%")
-
-    with c3:
-        st.markdown("**Period Range**")
-        st.write("High:", f"{hist_data['High'].max():.2f}")
-        st.write("Low:", f"{hist_data['Low'].min():.2f}")
-
 # =============================
-# TAB 2: Financial Metrics
+# TAB 2: Financial Metrics (Quote-first; works on Free)
 # =============================
 with tab2:
-    st.subheader("Company Financial Metrics")
+    st.subheader("Financial Snapshot (Twelve Data)")
 
-    if provider == "twelve":
-        with st.spinner("Loading Twelve Data snapshot..."):
-            quote = td_quote(symbol) or {}
-            stats = td_statistics(symbol) or {}
-            prof = td_profile(symbol) or {}
+    quote = td_quote(symbol)
 
-        if show_debug:
-            with st.expander("🔧 Debug: quote / statistics / profile raw", expanded=False):
-                st.write("quote:", quote)
-                st.write("statistics:", stats)
-                st.write("profile:", prof)
-
-        # Quote metrics (usually available)
-        q_price = _safe_float(quote.get("close") or quote.get("price"))
-        q_change = _safe_float(quote.get("change"))
-        q_change_pct = _safe_float(quote.get("percent_change"))
-        q_volume = _safe_float(quote.get("volume"))
-        q_avg_volume = _safe_float(quote.get("average_volume"))
+    # لو ما رجع شيء
+    if not isinstance(quote, dict) or quote.get("status") == "error" or len(quote) == 0:
+        st.warning("Financial snapshot not available for this symbol on your current Twelve Data access.")
+        if isinstance(quote, dict) and quote.get("message"):
+            st.caption(quote.get("message"))
+    else:
+        last = _safe_float(quote.get("close") or quote.get("price"))
+        chg = _safe_float(quote.get("change"))
+        chg_pct = _safe_float(quote.get("percent_change"))
+        vol = _safe_float(quote.get("volume"))
+        avg_vol = _safe_float(quote.get("average_volume"))
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Last Price", f"{q_price:.2f}" if q_price is not None else "N/A")
-        if q_change is not None and q_change_pct is not None:
-            c2.metric("Change", f"{q_change:+.2f}", f"{q_change_pct:+.2f}%")
+        c1.metric("Last Price", f"{last:.2f}" if last is not None else "N/A")
+        if chg is not None and chg_pct is not None:
+            c2.metric("Change", f"{chg:+.2f}", f"{chg_pct:+.2f}%")
         else:
             c2.metric("Change", "N/A")
-        c3.metric("Volume", f"{q_volume:,.0f}" if q_volume is not None else "N/A")
-        c4.metric("Avg Volume", f"{q_avg_volume:,.0f}" if q_avg_volume is not None else "N/A")
+        c3.metric("Volume", f"{vol:,.0f}" if vol is not None else "N/A")
+        c4.metric("Avg Volume", f"{avg_vol:,.0f}" if avg_vol is not None else "N/A")
 
-        st.markdown("---")
-
-        # Optional metrics (may be missing on free plan)
-        market_cap = _safe_float(stats.get("market_cap") or stats.get("market_capitalization"))
-        pe_ratio = _safe_float(stats.get("pe_ratio") or stats.get("pe"))
-        eps = _safe_float(stats.get("eps") or stats.get("eps_ttm"))
-        div_yield = _safe_float(stats.get("dividend_yield"))
-
-        left, right = st.columns(2)
-        with left:
-            st.markdown("### 📊 Extra (if available)")
-            st.metric("Market Cap", _human_money(market_cap))
-            st.metric("P/E", f"{pe_ratio:.2f}" if pe_ratio is not None else "N/A")
-            st.metric("EPS", f"{eps:.2f}" if eps is not None else "N/A")
-            st.metric("Dividend Yield", _human_pct(div_yield))
-
-        with right:
-            st.markdown("### 📝 Company Info (if available)")
-            st.write("Name:", prof.get("name") or prof.get("instrument_name") or "N/A")
-            st.write("Sector:", prof.get("sector", "N/A"))
-            st.write("Industry:", prof.get("industry", "N/A"))
-            st.write("Country:", prof.get("country", "N/A"))
-            st.write("Website:", prof.get("website", "N/A"))
-
-        if not quote:
-            st.warning("Quote endpoint returned empty. This may be a plan/coverage limitation on Twelve Data (free plan is limited).")
-
-    else:
-        # yfinance fallback metrics for Saudi
-        st.caption("Saudi metrics are fetched via Yahoo (yfinance). Some fields may be blocked on Streamlit Cloud.")
-        meta = yf_info(res["yahoo_sym"])
-        fi = meta.get("fast_info", {}) or {}
-        info = meta.get("info", {}) or {}
-
-        market_cap = _safe_float(info.get("marketCap") or fi.get("marketCap"))
-        pe_ratio = _safe_float(info.get("trailingPE") or info.get("forwardPE"))
-        eps = _safe_float(info.get("trailingEps"))
-        div_yield = _safe_float(info.get("dividendYield"))
-
-        left, right = st.columns(2)
-        with left:
-            st.markdown("### 📊 Key Metrics (Yahoo)")
-            st.metric("Market Cap", _human_money(market_cap))
-            st.metric("P/E", f"{pe_ratio:.2f}" if pe_ratio is not None else "N/A")
-            st.metric("EPS", f"{eps:.2f}" if eps is not None else "N/A")
-            st.metric("Dividend Yield", _human_pct(div_yield))
-
-        with right:
-            st.markdown("### 📝 Company Info (Yahoo)")
-            st.write("Long Name:", info.get("longName") or info.get("shortName") or "N/A")
-            st.write("Sector:", info.get("sector") or "N/A")
-            st.write("Industry:", info.get("industry") or "N/A")
-            st.write("Country:", info.get("country") or "Saudi Arabia")
-            st.write("Website:", info.get("website") or "N/A")
-
-        if show_debug:
-            with st.expander("🔧 Debug: yfinance fast_info/info raw", expanded=False):
-                st.write(meta)
+        st.markdown("### Raw quote (debug)")
+        st.json(quote)
 
 # =============================
 # TAB 3: Forecast
