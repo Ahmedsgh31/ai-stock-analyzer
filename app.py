@@ -387,17 +387,21 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
 
     # ── 3. Google Gemini (FREE tier) ─────────────────────
     if keys["gemini"]:
-        gemini_models = [
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash-8b",
+        # Use models confirmed available from the account's model list
+        attempts = [
+            ("v1beta", "gemini-2.5-flash"),
+            ("v1beta", "gemini-2.0-flash"),
+            ("v1beta", "gemini-2.5-pro"),
+            ("v1beta", "gemini-2.0-flash-lite"),
         ]
         last_err = "unknown"
-        for model in gemini_models:
+        for version, model in attempts:
             try:
+                url = (f"https://generativelanguage.googleapis.com/"
+                       f"{version}/models/{model}:generateContent"
+                       f"?key={keys['gemini']}")
                 r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1/models/"
-                    f"{model}:generateContent?key={keys['gemini']}",
+                    url,
                     headers={"Content-Type": "application/json"},
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
@@ -413,15 +417,14 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                     text = d["candidates"][0]["content"]["parts"][0]["text"]
                     return text, f"Gemini ({model})"
                 last_err = d.get("error", {}).get("message", str(d))
-                if "quota" in last_err.lower() or "limit" in last_err.lower():
-                    continue
-                if "not found" in last_err.lower() or "not supported" in last_err.lower():
+                skip_phrases = ["not found", "not supported", "quota", "limit", "deprecated"]
+                if any(p in last_err.lower() for p in skip_phrases):
                     continue
                 return None, f"gemini_error: {last_err}"
             except Exception as e:
                 last_err = str(e)
                 continue
-        return None, f"gemini_failed: {last_err[:200]}"
+        return None, f"gemini_all_failed: {last_err[:200]}"
 
     return None, "no_provider"
 
