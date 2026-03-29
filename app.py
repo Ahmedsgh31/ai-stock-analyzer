@@ -385,28 +385,43 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
         except Exception as e:
             return None, f"openai_exception: {e}"
 
-    # ── 3. Google Gemini (FREE tier — no billing needed) ─
+    # ── 3. Google Gemini (FREE tier) ─────────────────────
     if keys["gemini"]:
-        try:
-            r = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.0-flash:generateContent?key={keys['gemini']}",
-                headers={"Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"maxOutputTokens": 900,
-                                           "temperature": 0.4}},
-                timeout=45,
-            )
-            d = r.json()
-            if "candidates" in d and d["candidates"]:
-                text = d["candidates"][0]["content"]["parts"][0]["text"]
-                return text, "Gemini"
-            err = d.get("error", {}).get("message", "unknown")
-            return None, f"gemini_error: {err}"
-        except Exception as e:
-            return None, f"gemini_exception: {e}"
-
-    return None, "failed"
+        # Try models in order — 1.5-flash has most reliable free quota
+        gemini_models = [
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-2.0-flash-lite",
+        ]
+        last_err = "unknown"
+        for model in gemini_models:
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={keys['gemini']}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "maxOutputTokens": 900,
+                            "temperature": 0.4,
+                        },
+                    },
+                    timeout=45,
+                )
+                d = r.json()
+                if "candidates" in d and d["candidates"]:
+                    text = d["candidates"][0]["content"]["parts"][0]["text"]
+                    return text, f"Gemini ({model})"
+                last_err = d.get("error", {}).get("message", str(d))
+                # If quota exceeded on this model, try next
+                if "quota" in last_err.lower() or "limit" in last_err.lower():
+                    continue
+                return None, f"gemini_error: {last_err}"
+            except Exception as e:
+                last_err = str(e)
+                continue
+        return None, f"gemini_quota: {last_err[:200]}"
 
 # ════════════════════════════════════════════════════════
 # SIDEBAR
@@ -922,10 +937,18 @@ Get key: [platform.openai.com](https://platform.openai.com)
                     "Educational purposes only · Not financial advice"
                 )
             else:
-                st.error(
-                    f"AI call failed: `{status}`\n\n"
-                    "Check your API key is correct and has not exceeded its quota."
-                )
+                if "quota" in status.lower() or "limit" in status.lower():
+                    st.error(
+                        "⏳ **Gemini quota temporarily exceeded.**\n\n"
+                        "This usually resolves in a few seconds. "
+                        "**Wait 10 seconds and click Generate again.**\n\n"
+                        f"Detail: `{status[:150]}`"
+                    )
+                else:
+                    st.error(
+                        f"AI call failed: `{status}`\n\n"
+                        "Check your API key is correct and has not exceeded its quota."
+                    )
 
 st.markdown("---")
 st.caption("Data: Yahoo Finance · Educational purposes only · Not financial advice")
