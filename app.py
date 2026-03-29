@@ -315,42 +315,74 @@ def _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency, horizo
     upside  = (f"{((fc_df['Forecast'].iloc[-1]/price - 1)*100):+.1f}%"
                if (fc_df is not None and not fc_df.empty and price and price > 0) else "N/A")
     rsi_txt  = f"{rsi_val:.1f}" if rsi_val else "N/A"
+    rsi_lbl  = "overbought" if rsi_val and rsi_val > 70 else "oversold" if rsi_val and rsi_val < 30 else "neutral"
     macd_txt = ("Bullish momentum" if (macd_val and macd_val > 0)
                 else "Bearish momentum" if macd_val else "N/A")
-    return f"""You are a senior CFA charterholder and portfolio manager. Write a complete, detailed investment analysis of {name} ({symbol}). You MUST write all 4 paragraphs in full — do not stop early.
+    is_saudi = ".SR" in symbol or country.lower() in ("saudi arabia", "sa")
+    strategic_block = ""
+    if is_saudi:
+        strategic_block = """
+STRATEGIC CONTEXT FOR THIS ANALYSIS:
+- Saudi Vision 2030: reducing oil dependency, diversifying into tourism, fintech, mining, entertainment.
+- Public Investment Fund (PIF) as key institutional shareholder and strategic direction-setter.
+- Giga-projects: NEOM, Red Sea Project, Qiddiya, Diriyah — assess if this company benefits or is burdened.
+- OPEC+ production decisions and their direct impact on company revenues and strategy.
+- Saudi Green Initiative and global ESG pressure on hydrocarbon companies.
+- Vision vs Reality: use the actual financial data provided to assess whether this company
+  is genuinely delivering on transformation promises or still overwhelmingly dependent on legacy operations.
+- Global expansion footprint: which countries, what partnerships, what percentage of revenue is international?"""
 
-COMPANY DATA:
-- Country: {country} | Sector: {sector} | Currency: {currency}
-- Market Cap: {mktcap} | Current Price: {price} {currency}
-- Analyst Consensus: {rec} | Mean Price Target: {target}
+    prompt = f"""You are a senior CFA charterholder, strategic analyst, and Gulf markets specialist. Write a detailed, honest, and insightful investment analysis of {name} ({symbol}). Every section must be fully written — do not cut short.
+{strategic_block}
+LIVE FINANCIAL DATA (use these exact numbers in your analysis):
+Market Cap: {mktcap} | Price: {price} {currency} | Analyst Target: {target} | Consensus: {rec}
+P/E (TTM): {pe} | P/E (Fwd): {fpe} | P/B: {pb} | EV/EBITDA: {ev_eb}
+Revenue: {rev} | Gross Margin: {gm} | Net Margin: {margin} | ROE: {roe} | D/E: {de} | FCF: {fcf}
+RSI (14): {rsi_txt} ({rsi_lbl}) | MACD: {macd_txt}
+{horizon}-day Ensemble Forecast: {fc_end} {currency} ({upside} implied)
 
-VALUATION METRICS:
-- P/E (Trailing): {pe} | P/E (Forward): {fpe} | P/B: {pb} | EV/EBITDA: {ev_eb}
+---
+ENGLISH ANALYSIS
+---
 
-FINANCIAL HEALTH:
-- Revenue: {rev} | Gross Margin: {gm} | Net Margin: {margin}
-- Return on Equity: {roe} | Debt/Equity: {de} | Free Cash Flow: {fcf}
+Write all 6 sections completely. Each section must have at least 5 sentences.
 
-TECHNICAL SIGNALS:
-- RSI (14): {rsi_txt} — {("overbought" if rsi_val and rsi_val > 70 else "oversold" if rsi_val and rsi_val < 30 else "neutral")}
-- MACD: {macd_txt}
-- Ensemble Forecast ({horizon}d): {fc_end} {currency} | Implied move: {upside}
+**1. 🏢 Business & Competitive Position**
+Describe {name}'s core operations, dominant market position, key assets, revenue structure, and strategic importance to {country}'s economy. What makes this company structurally difficult to compete with?
 
-Write EXACTLY these 4 complete paragraphs — each must be 4-6 sentences minimum:
+**2. 🌍 Strategic Vision & Global Expansion**
+What is {name}'s stated long-term strategy? Where is the company expanding internationally — name specific countries, regions, or partnerships. What major projects or investments are in progress? How does this tie into national development goals? Be specific with named initiatives and timelines where known.
 
-**1. BUSINESS OVERVIEW**
-Describe what {name} does, its market position, competitive advantages, and why it matters to investors. Include context about its role in the {sector} sector and {country} economy.
+**3. ✅ Vision vs Reality — Honest Scorecard**
+Compare the company's stated ambitions to its actual delivered results. Use the financial metrics above as evidence — what do the margins, ROE, FCF, and revenue trajectory reveal about execution quality? Is the company ahead of schedule, on track, or falling behind on its transformation agenda? Be direct and evidence-based, not promotional.
 
-**2. VALUATION VERDICT**
-Assess whether the stock is cheap, fairly valued, or expensive. Reference the actual P/E, EV/EBITDA, and P/B numbers above. Compare to typical sector benchmarks. State clearly whether the valuation is attractive for an investor today.
+**4. 📊 Valuation Verdict**
+Using the P/E of {pe}, EV/EBITDA of {ev_eb}, and P/B of {pb}: is this stock cheap, fairly valued, or expensive relative to global and regional peers in the {sector} sector? Factor in the analyst target of {target} vs current price of {price} {currency}. What is the margin of safety or downside risk at current levels? Give a clear Buy / Hold / Wait recommendation with reasoning.
 
-**3. TECHNICAL MOMENTUM & FORECAST**
-Interpret the RSI and MACD signals. Explain what the {horizon}-day ensemble forecast of {fc_end} {currency} ({upside}) suggests. Describe the short-term price momentum and what a trader vs long-term investor should note.
+**5. 📉 Technical Momentum & Price Forecast**
+Interpret RSI at {rsi_txt} ({rsi_lbl}) and MACD ({macd_txt}) for near-term direction. What does the {horizon}-day ensemble model forecast of {fc_end} {currency} ({upside}) imply about the stock's trajectory? What should a short-term trader do differently from a long-term investor at this juncture?
 
-**4. RISKS & OPPORTUNITIES**
-Name and explain exactly 2 key risks (be specific, not generic). Name and explain exactly 2 key catalysts or opportunities that could drive the stock higher. Be specific to this company and sector.
+**6. ⚠️ Risks & Catalysts**
+- **Risk 1:** [name it, explain specifically why it matters for THIS company]
+- **Risk 2:** [name it, explain specifically why it matters for THIS company]
+- **Catalyst 1:** [name it, explain specifically how it could drive the stock higher]
+- **Catalyst 2:** [name it, explain specifically how it could drive the stock higher]
 
-End with a single bold sentence: **VERDICT: [your conclusion]**"""
+**⚖️ VERDICT:** [One decisive, bold concluding sentence for an investor deciding today]
+
+---
+## التحليل بالعربية
+---
+
+الآن قم بترجمة التحليل الكامل أعلاه إلى اللغة العربية الفصحى المالية الرسمية.
+ترجم جميع الأقسام الستة كاملةً مع جميع العناوين ونقاط البيانات والأرقام والحكم النهائي.
+احتفظ بجميع الأرقام والرموز (مثل {symbol}، {price} {currency}) كما هي بدون ترجمة.
+استخدم المصطلحات المالية العربية الصحيحة. لا تختصر أي قسم.
+
+ابدأ كل قسم بنفس رقم وعنوان القسم الإنجليزي مترجماً إلى العربية."""
+
+    return prompt
+
 
 def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
     keys = get_api_keys()
@@ -368,7 +400,7 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                 headers={"x-api-key": keys["anthropic"],
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 2048,
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 4096,
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=45,
             )
@@ -390,7 +422,7 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {keys['openai']}",
                          "Content-Type": "application/json"},
-                json={"model": "gpt-4o", "max_tokens": 2048,
+                json={"model": "gpt-4o", "max_tokens": 4096,
                       "messages": [
                           {"role": "system", "content": "You are a senior CFA charterholder."},
                           {"role": "user",   "content": prompt}]},
@@ -424,7 +456,7 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
                         "generationConfig": {
-                            "maxOutputTokens": 2048,
+                            "maxOutputTokens": 4096,
                             "temperature": 0.4,
                         },
                     },
