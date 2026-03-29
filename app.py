@@ -279,22 +279,27 @@ def ensemble_forecast(series: pd.Series, horizon: int) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════
 def get_api_keys():
     try:
-        return (st.secrets.get("ANTHROPIC_API_KEY") or None,
-                st.secrets.get("OPENAI_API_KEY")    or None)
+        return {
+            "anthropic": st.secrets.get("ANTHROPIC_API_KEY") or None,
+            "openai":    st.secrets.get("OPENAI_API_KEY")    or None,
+            "gemini":    st.secrets.get("GEMINI_API_KEY")    or None,
+        }
     except Exception:
-        return None, None
+        return {"anthropic": None, "openai": None, "gemini": None}
 
-def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
-    ak, ok = get_api_keys()
-    if not ak and not ok:
-        return None, "no_key"
+def _active_provider(keys: dict) -> str:
+    """Return the name of the first available provider."""
+    if keys["anthropic"]: return "Claude"
+    if keys["openai"]:    return "GPT-4o"
+    if keys["gemini"]:    return "Gemini"
+    return None
 
+def _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency):
     pe      = _num(_sf(info.get("trailingPE")  or info.get("forwardPE")))
     fpe     = _num(_sf(info.get("forwardPE")))
     rev     = _money(_sf(info.get("totalRevenue")))
     margin  = _pct(_sf(info.get("profitMargins")))
     gm      = _pct(_sf(info.get("grossMargins")))
-    beta    = _num(_sf(info.get("beta")))
     roe     = _pct(_sf(info.get("returnOnEquity")))
     de      = _num(_sf(info.get("debtToEquity")))
     ev_eb   = _num(_sf(info.get("enterpriseToEbitda")))
@@ -306,15 +311,13 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
     price   = _sf(info.get("currentPrice") or info.get("regularMarketPrice"))
     sector  = info.get("sector", "Unknown")
     country = info.get("country", "")
-
-    fc_end = f"{fc_df['Forecast'].iloc[-1]:.2f}" if (fc_df is not None and not fc_df.empty) else "N/A"
-    upside = (f"{((fc_df['Forecast'].iloc[-1]/price - 1)*100):+.1f}%"
-              if (fc_df is not None and not fc_df.empty and price and price > 0) else "N/A")
-    rsi_txt  = f"{rsi_val:.1f}"  if rsi_val  else "N/A"
+    fc_end  = f"{fc_df['Forecast'].iloc[-1]:.2f}" if (fc_df is not None and not fc_df.empty) else "N/A"
+    upside  = (f"{((fc_df['Forecast'].iloc[-1]/price - 1)*100):+.1f}%"
+               if (fc_df is not None and not fc_df.empty and price and price > 0) else "N/A")
+    rsi_txt  = f"{rsi_val:.1f}" if rsi_val else "N/A"
     macd_txt = ("Bullish momentum" if (macd_val and macd_val > 0)
                 else "Bearish momentum" if macd_val else "N/A")
-
-    prompt = f"""You are a senior CFA charterholder and portfolio manager. Provide a professional investment analysis of {name} ({symbol}).
+    return f"""You are a senior CFA charterholder and portfolio manager. Provide a professional investment analysis of {name} ({symbol}).
 
 COMPANY: {country} | Sector: {sector} | Currency: {currency}
 Market Cap: {mktcap} | Price: {price} {currency} | Analyst Target: {target} | Consensus: {rec}
@@ -322,7 +325,7 @@ Market Cap: {mktcap} | Price: {price} {currency} | Analyst Target: {target} | Co
 VALUATION: P/E(TTM)={pe} | P/E(Fwd)={fpe} | P/B={pb} | EV/EBITDA={ev_eb}
 FINANCIALS: Revenue={rev} | Gross Margin={gm} | Net Margin={margin} | ROE={roe} | D/E={de} | FCF={fcf}
 TECHNICALS: RSI(14)={rsi_txt} | MACD={macd_txt}
-FORECAST: 30-day ARIMA target={fc_end} {currency} | Implied move={upside}
+FORECAST: Ensemble target={fc_end} {currency} | Implied move={upside}
 
 Write exactly 4 paragraphs:
 1. BUSINESS OVERVIEW: What does this company do and what is its competitive position?
@@ -330,13 +333,22 @@ Write exactly 4 paragraphs:
 3. TECHNICAL & MOMENTUM: What do RSI, MACD, and the price forecast suggest?
 4. RISKS & OPPORTUNITIES: 2 key risks and 2 key catalysts an investor must watch.
 
-End with one bold VERDICT sentence. Be direct and analytical."""
+End with one bold **VERDICT** sentence. Be direct and analytical."""
 
-    if ak:
+def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
+    keys = get_api_keys()
+    if not any(keys.values()):
+        return None, "no_key"
+
+    prompt = _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency)
+
+    # ── 1. Claude ────────────────────────────────────────
+    if keys["anthropic"]:
         try:
             r = requests.post(
                 "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": ak, "anthropic-version": "2023-06-01",
+                headers={"x-api-key": keys["anthropic"],
+                         "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
                 json={"model": "claude-sonnet-4-20250514", "max_tokens": 900,
                       "messages": [{"role": "user", "content": prompt}]},
@@ -344,16 +356,21 @@ End with one bold VERDICT sentence. Be direct and analytical."""
             )
             d = r.json()
             if "content" in d and d["content"]:
-                return d["content"][0]["text"], "claude"
-            return None, f"claude_error: {d.get('error',{}).get('message','unknown')}"
+                return d["content"][0]["text"], "Claude"
+            err = d.get("error", {}).get("message", "unknown")
+            # If out of credits, fall through to next provider
+            if "credit" not in err.lower() and "balance" not in err.lower():
+                return None, f"claude_error: {err}"
+            # else fall through silently
         except Exception as e:
             return None, f"claude_exception: {e}"
 
-    if ok:
+    # ── 2. OpenAI ────────────────────────────────────────
+    if keys["openai"]:
         try:
             r = requests.post(
                 "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {ok}",
+                headers={"Authorization": f"Bearer {keys['openai']}",
                          "Content-Type": "application/json"},
                 json={"model": "gpt-4o", "max_tokens": 900,
                       "messages": [
@@ -363,10 +380,31 @@ End with one bold VERDICT sentence. Be direct and analytical."""
             )
             d = r.json()
             if "choices" in d:
-                return d["choices"][0]["message"]["content"], "gpt4o"
+                return d["choices"][0]["message"]["content"], "GPT-4o"
             return None, f"openai_error: {d.get('error',{}).get('message','unknown')}"
         except Exception as e:
             return None, f"openai_exception: {e}"
+
+    # ── 3. Google Gemini (FREE tier — no billing needed) ─
+    if keys["gemini"]:
+        try:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"gemini-2.0-flash:generateContent?key={keys['gemini']}",
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"maxOutputTokens": 900,
+                                           "temperature": 0.4}},
+                timeout=45,
+            )
+            d = r.json()
+            if "candidates" in d and d["candidates"]:
+                text = d["candidates"][0]["content"]["parts"][0]["text"]
+                return text, "Gemini"
+            err = d.get("error", {}).get("message", "unknown")
+            return None, f"gemini_error: {err}"
+        except Exception as e:
+            return None, f"gemini_exception: {e}"
 
     return None, "failed"
 
@@ -401,18 +439,22 @@ with st.sidebar:
     cb.markdown("🇸🇦 **Saudi**\n\n`2222.SR`\n\n`1120.SR`\n\n`2010.SR`\n\n`1180.SR`\n\n`7010.SR`")
 
     st.markdown("---")
-    ak, ok = get_api_keys()
-    has_ai   = bool(ak or ok)
-    provider = "Claude" if ak else ("GPT-4o" if ok else None)
-    if has_ai:
+    keys     = get_api_keys()
+    provider = _active_provider(keys)
+    if provider:
         st.success(f"🤖 AI: **{provider}** ready")
     else:
-        st.warning("🤖 AI: add API key to enable")
-        with st.expander("How to enable"):
+        st.warning("🤖 AI: add an API key")
+        with st.expander("Free option — Google Gemini"):
+            st.markdown(
+                "1. Go to [aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+                "2. Click **Get API key** → free, no credit card\n"
+                "3. Add to **Settings → Secrets**:\n"
+            )
+            st.code('GEMINI_API_KEY = "AIza..."', language="toml")
+        with st.expander("Paid options"):
             st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
-            st.caption("or")
             st.code('OPENAI_API_KEY = "sk-..."', language="toml")
-            st.caption("Add in Settings → Secrets")
 
     st.markdown("---")
     go_btn = st.button("🔍 Analyze Stock", type="primary", use_container_width=True)
@@ -821,33 +863,40 @@ with tab3:
 # ════════════════════════════════════════════════════════
 with tab4:
     hdr("🤖 AI Investment Analysis")
-    ak, ok   = get_api_keys()
-    has_ai   = bool(ak or ok)
-    provider = "Claude" if ak else ("GPT-4o" if ok else None)
+    keys     = get_api_keys()
+    provider = _active_provider(keys)
 
-    if not has_ai:
+    if not provider:
         st.markdown("""
-### Enable AI Analysis
+### Enable AI Analysis — Free Option Available
 
-This tab generates a **CFA-level 4-paragraph investment analysis** combining:
-- Fundamental valuation (P/E, EV/EBITDA, margins)
-- Technical signals (RSI, MACD)
-- ARIMA forecast outlook
-- Key risks and catalysts
+This tab generates a **CFA-level 4-paragraph analysis** combining fundamentals,
+technicals, and the ensemble forecast.
 
-**To activate:** go to ⚙️ **Settings → Secrets** in your Streamlit app and add:
-
+---
+#### 🆓 Option 1 — Google Gemini (FREE · no credit card needed)
+1. Go to **[aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)**
+2. Sign in with Google → click **Get API key** → **Create API key**
+3. Copy the key (starts with `AIza...`)
+4. In your Streamlit app → ⚙️ **Settings → Secrets**, add:
 ```toml
-ANTHROPIC_API_KEY = "sk-ant-your-key-here"
+GEMINI_API_KEY = "AIzaSy..."
 ```
+✅ Free tier: 1,500 requests/day — plenty for personal use.
 
-or
-
+---
+#### 💳 Option 2 — Anthropic Claude (best quality · ~$5 credit needed)
 ```toml
-OPENAI_API_KEY = "sk-your-key-here"
+ANTHROPIC_API_KEY = "sk-ant-..."
 ```
+Get key: [console.anthropic.com](https://console.anthropic.com)
 
-Get a free Anthropic key at [console.anthropic.com](https://console.anthropic.com)
+---
+#### 💳 Option 3 — OpenAI GPT-4o
+```toml
+OPENAI_API_KEY = "sk-..."
+```
+Get key: [platform.openai.com](https://platform.openai.com)
 """)
     else:
         st.success(f"✅ Powered by **{provider}**")
@@ -868,9 +917,15 @@ Get a free Anthropic key at [console.anthropic.com](https://console.anthropic.co
                 st.markdown("---")
                 st.markdown(narrative)
                 st.markdown("---")
-                st.caption(f"Generated by {provider} · Educational purposes only · Not financial advice")
+                st.caption(
+                    f"Generated by {provider} · "
+                    "Educational purposes only · Not financial advice"
+                )
             else:
-                st.error(f"AI call failed: `{status}`\n\nCheck your API key has available credits.")
+                st.error(
+                    f"AI call failed: `{status}`\n\n"
+                    "Check your API key is correct and has not exceeded its quota."
+                )
 
 st.markdown("---")
 st.caption("Data: Yahoo Finance · Educational purposes only · Not financial advice")
