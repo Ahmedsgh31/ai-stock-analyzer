@@ -1,30 +1,65 @@
 """
-AI-Powered Stock Market Analyzer
-══════════════════════════════════
-Price data   → Twelve Data  (free plan, API key required)
-Fundamentals → Alpha Vantage (free plan, 25 req/day, API key required)
+AI-Powered Stock Market Analyzer — v2 (yfinance rebuild)
+══════════════════════════════════════════════════════════
+✅ NO API KEYS REQUIRED — uses yfinance (free, no limits)
+✅ Saudi Tadawul stocks supported (e.g. 2222.SR, 1120.SR)
+✅ Full fundamentals: P/E, P/B, EV/EBITDA, margins, cash flow
+✅ Technical indicators: RSI, MACD, Bollinger Bands
+✅ ARIMA forecast — statistically sound, no Prophet dependency issues
+✅ AI narrative analysis via Claude/OpenAI (optional — add key to Secrets)
 
-Add both keys to Streamlit → Settings → Secrets:
-    TWELVEDATA_API_KEY  = "your_key"
-    ALPHAVANTAGE_API_KEY = "your_key"
-
-Get free keys at:
-  https://twelvedata.com         (price history, quote)
-  https://www.alphavantage.co    (fundamentals)
+Optional AI narrative key (add to Streamlit → Settings → Secrets):
+    ANTHROPIC_API_KEY = "your_key"   ← uses Claude
+    OPENAI_API_KEY    = "your_key"   ← uses GPT-4o (fallback)
 """
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import yfinance as yf
+import requests
 
 # ── Page config ──────────────────────────────────────────
-st.set_page_config(page_title="AI Stock Analyzer", page_icon="📈", layout="wide")
-st.title("📈 AI-Powered Stock Market Analyzer")
-st.markdown("---")
+st.set_page_config(
+    page_title="AI Stock Analyzer",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ── Helpers ──────────────────────────────────────────────
+# ── Custom CSS ───────────────────────────────────────────
+st.markdown("""
+<style>
+    .metric-card {
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin: 4px 0;
+    }
+    .section-header {
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: #cdd6f4;
+        border-left: 3px solid #89b4fa;
+        padding-left: 10px;
+        margin: 20px 0 12px 0;
+    }
+    .positive { color: #a6e3a1; }
+    .negative { color: #f38ba8; }
+    .neutral  { color: #cdd6f4; }
+    [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════
+# HELPERS
+# ════════════════════════════════════════════════════════
 def _sf(x):
     try:
         if x is None: return None
@@ -32,7 +67,8 @@ def _sf(x):
             f = float(x)
             return None if (np.isnan(f) or np.isinf(f)) else f
         s = str(x).replace(",", "").strip()
-        if s.lower() in ("", "none", "n/a", "null", "nan", "-", "inf"): return None
+        if s.lower() in ("", "none", "n/a", "null", "nan", "-", "inf", "infinity"):
+            return None
         return float(s)
     except Exception:
         return None
@@ -47,10 +83,11 @@ def _money(x):
     if a >= 1e3:  return f"${v/1e3:.2f}K"
     return f"${v:.2f}"
 
-def _pct(x):
+def _pct(x, already_pct=False):
     v = _sf(x)
     if v is None: return "N/A"
-    if abs(v) < 2.0: v *= 100
+    if not already_pct and abs(v) <= 1.5:
+        v *= 100
     return f"{v:.2f}%"
 
 def _num(x, pre="", suf="", dec=2):
@@ -64,227 +101,357 @@ def _pick(d, *keys):
         if v is not None: return v
     return None
 
-def _picks(d, *keys):
+def _str(d, *keys):
     for k in keys:
         v = d.get(k)
         if v and str(v).strip().lower() not in ("", "none", "n/a", "null", "-"):
             return str(v).strip()
     return None
 
-# ── Shared HTTP session ───────────────────────────────────
-@st.cache_resource
-def _sess():
-    s = requests.Session()
-    s.headers.update({"User-Agent": "StockAnalyzer/4.0 (research)"})
-    return s
-
 # ════════════════════════════════════════════════════════
-# TWELVE DATA  ─  price + quote
+# DATA LAYER — yfinance (free, no API key needed)
 # ════════════════════════════════════════════════════════
-def _td_key():
-    try: return st.secrets.get("TWELVEDATA_API_KEY") or None
-    except Exception: return None
-
-def _td(endpoint, params, timeout=20):
-    k = _td_key()
-    if not k: return {"status":"error","message":"No TWELVEDATA_API_KEY in Secrets"}
+@st.cache_data(ttl=300, show_spinner=False)
+def get_ticker_data(symbol: str):
+    """Fetch everything from yfinance in one call."""
     try:
-        r = _sess().get(f"https://api.twelvedata.com/{endpoint}",
-                        params={**params, "apikey": k}, timeout=timeout)
-        return r.json()
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        return t, info
     except Exception as e:
-        return {"status":"error","message":str(e)}
+        return None, {}
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def td_resolve(sym: str) -> dict | None:
-    base = sym.replace(".SR","") if sym.endswith(".SR") else sym
-    is_sa = sym.endswith(".SR") or (sym.isdigit() and len(sym) in (3,4,5))
-    items = (_td("symbol_search",{"symbol":base,"outputsize":50}).get("data") or [])
-    if not items:
-        items = (_td("symbol_search",{"keywords":base,"outputsize":50}).get("data") or [])
-    if not items: return None
-
-    def sc(it):
-        s2  = (it.get("symbol","")).upper()
-        ex  = (it.get("exchange","")).lower()
-        cur = (it.get("currency","")).upper()
-        ct  = (it.get("country","")).lower()
-        sc2 = 10 if it.get("instrument_type","").lower()=="common stock" else 0
-        if is_sa:
-            if "saudi" in ct or "tadawul" in ex: sc2 += 70
-            if cur=="SAR": sc2 += 30
-            if s2==base: sc2 += 40
-        else:
-            if s2==sym: sc2 += 60
-            if ex in ("nasdaq","nyse","nyse american","nyse arca"): sc2 += 20
-        return sc2
-    return sorted(items, key=sc, reverse=True)[0]
-
-@st.cache_data(ttl=600, show_spinner=False)
-def td_ohlcv(symbol, exchange, interval, outputsize):
-    p = {"symbol":symbol,"interval":interval,
-         "outputsize":outputsize,"format":"JSON"}
-    if exchange: p["exchange"] = exchange
-    d = _td("time_series", p)
-    if d.get("status")=="error":
-        return pd.DataFrame(), d.get("message","")
-    vals = d.get("values") or []
-    if not vals: return pd.DataFrame(), "empty response"
-    df = pd.DataFrame(vals)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").set_index("datetime")
-    for c in ["open","high","low","close","volume"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.rename(columns={"open":"Open","high":"High","low":"Low",
-                             "close":"Close","volume":"Volume"})
-    for col in ["Open","High","Low","Close"]:
-        if col not in df.columns: return pd.DataFrame(), f"Missing {col}"
-    if "Volume" not in df.columns: df["Volume"] = 0
-    return df.dropna(subset=["Close"]), ""
-
-@st.cache_data(ttl=60, show_spinner=False)
-def td_quote(symbol, exchange):
-    p = {"symbol":symbol,"format":"JSON"}
-    if exchange: p["exchange"] = exchange
-    d = _td("quote", p)
-    return {} if d.get("status")=="error" else d
-
-# ════════════════════════════════════════════════════════
-# ALPHA VANTAGE  ─  fundamentals (free, no IP blocks)
-# ════════════════════════════════════════════════════════
-def _av_key():
-    try: return st.secrets.get("ALPHAVANTAGE_API_KEY") or None
-    except Exception: return None
-
-def _av(function, symbol, extra=None, timeout=20):
-    k = _av_key()
-    if not k: return {}
-    p = {"function": function, "symbol": symbol, "apikey": k}
-    if extra: p.update(extra)
+@st.cache_data(ttl=300, show_spinner=False)
+def get_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Fetch OHLCV history."""
     try:
-        r = _sess().get("https://www.alphavantage.co/query", params=p, timeout=timeout)
-        d = r.json()
-        # AV returns {"Information":"..."} when rate limited
-        if "Information" in d or "Note" in d: return {}
-        return d
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval=interval, auto_adjust=True)
+        if df.empty:
+            return pd.DataFrame()
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df
     except Exception:
-        return {}
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def av_overview(symbol: str) -> dict:
-    """OVERVIEW – company profile + valuation + dividends + financials."""
-    return _av("OVERVIEW", symbol)
+def get_financials(symbol: str):
+    """Fetch income statement, balance sheet, cash flow."""
+    try:
+        t = yf.Ticker(symbol)
+        return {
+            "income":   t.financials,
+            "balance":  t.balance_sheet,
+            "cashflow": t.cashflow,
+        }
+    except Exception:
+        return {"income": None, "balance": None, "cashflow": None}
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def av_income(symbol: str) -> dict:
-    return _av("INCOME_STATEMENT", symbol)
+def latest_val(df, *row_names):
+    """Get the most recent value from a financials DataFrame."""
+    if df is None or df.empty:
+        return None
+    for name in row_names:
+        if name in df.index:
+            row = df.loc[name].dropna()
+            if not row.empty:
+                return _sf(row.iloc[0])
+    return None
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def av_balance(symbol: str) -> dict:
-    return _av("BALANCE_SHEET", symbol)
+# ════════════════════════════════════════════════════════
+# TECHNICAL INDICATORS (pure numpy/pandas — no ta-lib needed)
+# ════════════════════════════════════════════════════════
+def calc_rsi(series: pd.Series, period=14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_g = gain.ewm(alpha=1/period, min_periods=period).mean()
+    avg_l = loss.ewm(alpha=1/period, min_periods=period).mean()
+    rs    = avg_g / avg_l.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def av_cashflow(symbol: str) -> dict:
-    return _av("CASH_FLOW", symbol)
+def calc_macd(series: pd.Series, fast=12, slow=26, signal=9):
+    ema_f  = series.ewm(span=fast,   adjust=False).mean()
+    ema_s  = series.ewm(span=slow,   adjust=False).mean()
+    macd   = ema_f - ema_s
+    sig    = macd.ewm(span=signal,   adjust=False).mean()
+    hist   = macd - sig
+    return macd, sig, hist
 
-@st.cache_data(ttl=60, show_spinner=False)
-def av_quote(symbol: str) -> dict:
-    """GLOBAL_QUOTE – live price from Alpha Vantage."""
-    d = _av("GLOBAL_QUOTE", symbol)
-    return d.get("Global Quote") or {}
+def calc_bbands(series: pd.Series, period=20, std=2):
+    ma    = series.rolling(period).mean()
+    sd    = series.rolling(period).std()
+    upper = ma + std * sd
+    lower = ma - std * sd
+    return upper, ma, lower
+
+def calc_sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period).mean()
+
+# ════════════════════════════════════════════════════════
+# ARIMA FORECAST
+# ════════════════════════════════════════════════════════
+def arima_forecast(series: pd.Series, horizon: int):
+    """
+    Fit ARIMA(1,1,1) on log-prices and return forecast + 95% CI.
+    Falls back gracefully if statsmodels not available.
+    """
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+        log_s = np.log(series.values.astype(float))
+        model = ARIMA(log_s, order=(1, 1, 1))
+        fit   = model.fit()
+        fc    = fit.get_forecast(steps=horizon)
+        mean  = np.exp(fc.predicted_mean)
+        ci    = np.exp(fc.conf_int(alpha=0.05))
+        last  = series.index[-1]
+        fdate = pd.date_range(last, periods=horizon + 1, freq="B")[1:]
+        return pd.DataFrame({
+            "Date":  fdate,
+            "Forecast": mean,
+            "Low CI":   ci[:, 0],
+            "High CI":  ci[:, 1],
+        })
+    except ImportError:
+        # statsmodels not installed — use linear trend with noise estimate
+        return _linear_forecast(series, horizon)
+    except Exception:
+        return _linear_forecast(series, horizon)
+
+def _linear_forecast(series: pd.Series, horizon: int):
+    """Linear trend fallback with simple std-based CI."""
+    y    = series.values.astype(float)
+    x    = np.arange(len(y))
+    coef = np.polyfit(x, y, 1)
+    trend = np.poly1d(coef)
+    xa   = np.arange(len(y), len(y) + horizon)
+    yhat = trend(xa)
+    std  = np.std(y[-30:]) if len(y) >= 30 else np.std(y)
+    last = series.index[-1]
+    fd   = pd.date_range(last, periods=horizon + 1, freq="B")[1:]
+    return pd.DataFrame({
+        "Date":    fd,
+        "Forecast": yhat,
+        "Low CI":   yhat - 1.96 * std,
+        "High CI":  yhat + 1.96 * std,
+    })
+
+# ════════════════════════════════════════════════════════
+# AI NARRATIVE (optional — needs ANTHROPIC_API_KEY or OPENAI_API_KEY)
+# ════════════════════════════════════════════════════════
+def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val):
+    """Call Claude or GPT to generate a plain-English stock analysis."""
+    anthropic_key = None
+    openai_key    = None
+    try:
+        anthropic_key = st.secrets.get("ANTHROPIC_API_KEY")
+        openai_key    = st.secrets.get("OPENAI_API_KEY")
+    except Exception:
+        pass
+
+    if not anthropic_key and not openai_key:
+        return None
+
+    pe      = _sf(info.get("trailingPE") or info.get("forwardPE"))
+    rev     = _sf(info.get("totalRevenue"))
+    margin  = _sf(info.get("profitMargins"))
+    beta    = _sf(info.get("beta"))
+    target  = _sf(info.get("targetMeanPrice"))
+    price   = _sf(info.get("currentPrice") or info.get("regularMarketPrice"))
+    sector  = info.get("sector", "Unknown")
+
+    fc_end  = f"{fc_df['Forecast'].iloc[-1]:.2f}" if fc_df is not None and not fc_df.empty else "N/A"
+    upside  = f"{((fc_df['Forecast'].iloc[-1]/price - 1)*100):+.1f}%" if (
+        fc_df is not None and not fc_df.empty and price) else "N/A"
+
+    prompt = f"""You are a CFA-level financial analyst. Analyze {name} ({symbol}) based on:
+
+Key metrics:
+- Sector: {sector}
+- Current Price: {price}
+- P/E Ratio: {_num(pe)}
+- Revenue: {_money(rev)}
+- Profit Margin: {_pct(margin)}
+- Beta: {_num(beta)}
+- Analyst Mean Target: {_num(target, "$")}
+- RSI (14): {_num(rsi_val)}
+- MACD signal: {"Bullish" if macd_val and macd_val > 0 else "Bearish" if macd_val else "N/A"}
+- 30-day ARIMA forecast: {fc_end} ({upside} from current)
+
+Write a concise 4-paragraph analysis:
+1. Business snapshot and competitive position
+2. Valuation assessment (cheap/fair/expensive vs sector norms)
+3. Technical momentum reading (RSI, MACD, trend)
+4. Key risks and opportunities — what should an investor watch?
+
+Be direct and specific. Avoid generic disclaimers inside the analysis. End with one sentence summary verdict."""
+
+    # Try Claude first
+    if anthropic_key:
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 800,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=30,
+            )
+            data = r.json()
+            return data["content"][0]["text"]
+        except Exception:
+            pass
+
+    # Fallback to OpenAI
+    if openai_key:
+        try:
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openai_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o",
+                    "max_tokens": 800,
+                    "messages": [
+                        {"role": "system", "content": "You are a CFA-level financial analyst."},
+                        {"role": "user",   "content": prompt},
+                    ],
+                },
+                timeout=30,
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            pass
+
+    return None
 
 # ════════════════════════════════════════════════════════
 # SIDEBAR
 # ════════════════════════════════════════════════════════
 with st.sidebar:
-    st.header("Search Stock")
-    stock_input = st.text_input("Enter Stock Symbol",
+    st.title("📈 Stock Analyzer")
+    st.caption("Powered by yfinance — no API keys needed")
+    st.markdown("---")
+
+    stock_input = st.text_input(
+        "Stock Symbol",
         placeholder="AAPL · TSLA · 2222.SR",
-        help="US: AAPL TSLA NVDA | Saudi: 2222.SR 1120.SR")
+        help="US: AAPL TSLA NVDA MSFT | Saudi: 2222.SR 1120.SR 2010.SR | Gulf: EMAAR.AE",
+    )
 
     period_map = {
-        "1 Month":  ("1day", 35),   "3 Months": ("1day", 95),
-        "6 Months": ("1day", 185),  "1 Year":   ("1day", 262),
-        "2 Years":  ("1day", 524),  "5 Years":  ("1day", 1310),
+        "1 Month":  ("1mo",  "1d"),
+        "3 Months": ("3mo",  "1d"),
+        "6 Months": ("6mo",  "1d"),
+        "1 Year":   ("1y",   "1d"),
+        "2 Years":  ("2y",   "1wk"),
+        "5 Years":  ("5y",   "1wk"),
     }
     sel_period = st.selectbox("Time Period", list(period_map.keys()), index=3)
-    show_debug = st.checkbox("Show debug info", value=False)
-    go_btn     = st.button("🔍 Analyze Stock", type="primary", use_container_width=True)
 
-    # Key status indicators
     st.markdown("---")
-    st.markdown("**API Keys**")
-    st.markdown("🟢 Twelve Data" if _td_key() else "🔴 Twelve Data (missing)")
-    st.markdown("🟢 Alpha Vantage" if _av_key() else "🔴 Alpha Vantage (missing)")
-    if not _td_key() or not _av_key():
-        st.info(
-            "Add keys in **Settings → Secrets**:\n"
-            "```\nTWELVEDATA_API_KEY = \"...\"\n"
-            "ALPHAVANTAGE_API_KEY = \"...\"\n```\n"
-            "Both are **free** at twelvedata.com and alphavantage.co"
-        )
+    st.markdown("**Examples**")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**US**\n- `AAPL`\n- `TSLA`\n- `NVDA`\n- `MSFT`\n- `AMZN`")
+    with col_b:
+        st.markdown("**Saudi**\n- `2222.SR`\n- `1120.SR`\n- `2010.SR`\n- `1180.SR`\n- `7010.SR`")
 
+    st.markdown("---")
+    # AI key status
+    try:
+        has_ai = bool(st.secrets.get("ANTHROPIC_API_KEY") or st.secrets.get("OPENAI_API_KEY"))
+    except Exception:
+        has_ai = False
+    st.markdown("**AI Narrative**")
+    if has_ai:
+        st.markdown("🟢 AI analysis enabled")
+    else:
+        st.markdown("🟡 AI analysis disabled")
+        with st.expander("Enable AI narrative"):
+            st.markdown(
+                "Add to **Settings → Secrets**:\n"
+                "```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```\n"
+                "or\n"
+                "```\nOPENAI_API_KEY = \"sk-...\"\n```"
+            )
+
+    st.markdown("---")
+    go_btn = st.button("🔍 Analyze Stock", type="primary", use_container_width=True)
+
+# ════════════════════════════════════════════════════════
+# LANDING PAGE
+# ════════════════════════════════════════════════════════
 if "result" not in st.session_state:
     st.session_state.result = None
 
+if not go_btn and not st.session_state.result:
+    st.title("AI-Powered Stock Market Analyzer")
+    st.markdown("""
+> **No API keys required.** Powered entirely by Yahoo Finance — free for everyone.
+
+### Supported Markets
+| Market | Examples | Notes |
+|--------|----------|-------|
+| NASDAQ / NYSE | `AAPL` `TSLA` `NVDA` `MSFT` `GOOGL` | Full data |
+| Saudi Tadawul | `2222.SR` `1120.SR` `2010.SR` | Full data ✅ |
+| Gulf / GCC | `EMAAR.AE` `FAB.AE` | Partial |
+| Global | Most major exchanges | Varies |
+
+### What you get
+- 📊 **Interactive price chart** — candlestick + volume + moving averages
+- 💼 **Full fundamentals** — P/E, P/B, EV/EBITDA, margins, cash flow, balance sheet
+- 📉 **Technical indicators** — RSI, MACD, Bollinger Bands
+- 🔮 **ARIMA forecast** — statistically sound 7–90 day outlook with confidence intervals
+- 🤖 **AI narrative** — CFA-level plain-English analysis (optional, add API key)
+""")
+    st.stop()
+
 # ════════════════════════════════════════════════════════
-# ON BUTTON PRESS
+# ON BUTTON PRESS — fetch data
 # ════════════════════════════════════════════════════════
 if go_btn:
     raw = (stock_input or "").strip().upper()
     if not raw:
-        st.warning("⚠️ Enter a stock symbol."); st.stop()
-
-    if not _td_key():
-        st.error("❌ **TWELVEDATA_API_KEY** is missing from Secrets.\n\n"
-                 "Get a free key at [twelvedata.com](https://twelvedata.com) "
-                 "and add it to **Settings → Secrets**.")
+        st.warning("⚠️ Enter a stock symbol first.")
         st.stop()
 
-    # Resolve symbol
-    with st.spinner("Resolving symbol…"):
-        resolved = td_resolve(raw)
+    period_yf, interval_yf = period_map[sel_period]
 
-    if not resolved:
-        st.error(f"Symbol **{raw}** not found in Twelve Data.")
-        st.info("Check the ticker. Saudi format: `2222.SR`. US: `AAPL`, `TSLA`.")
+    with st.spinner(f"Loading data for **{raw}**…"):
+        ticker, info = get_ticker_data(raw)
+        hist = get_history(raw, period_yf, interval_yf)
+
+    if hist.empty or ticker is None:
+        st.error(f"❌ No data found for **{raw}**")
+        st.info(
+            "**Tips:**\n"
+            "- Saudi stocks use `.SR` suffix: `2222.SR` not `2222`\n"
+            "- Check the symbol at [finance.yahoo.com](https://finance.yahoo.com)\n"
+            "- Some smaller stocks may not be available"
+        )
         st.stop()
 
-    td_sym  = resolved.get("symbol") or raw
-    td_ex   = resolved.get("exchange") or None
-    name    = resolved.get("instrument_name") or td_sym
-    cur     = resolved.get("currency") or "USD"
-
-    # Fetch price history
-    interval, outputsize = period_map[sel_period]
-    with st.spinner(f"Loading price data for {td_sym}…"):
-        hist, err = td_ohlcv(td_sym, td_ex, interval, outputsize)
-
-    if hist.empty:
-        st.error(f"❌ No price data for **{td_sym}**.")
-        st.caption(f"Twelve Data said: {err}")
-        # Saudi stocks need Pro plan — show helpful message
-        is_sa = raw.endswith(".SR") or (raw.isdigit() and len(raw) in (3,4,5))
-        if is_sa:
-            st.warning(
-                "Saudi (Tadawul) price data requires a **Twelve Data Pro plan**.\n\n"
-                "**Free alternatives for Saudi stocks:**\n"
-                "- Use [investing.com](https://www.investing.com) or "
-                "[mubasher.info](https://mubasher.info) manually\n"
-                "- Upgrade Twelve Data at [twelvedata.com/pricing](https://twelvedata.com/pricing)"
-            )
-        else:
-            st.info("This symbol may not be covered on the free plan, or the API limit was reached.")
+    # Validate we got real price data
+    if "Close" not in hist.columns or hist["Close"].dropna().empty:
+        st.error(f"❌ Price data unavailable for **{raw}**")
         st.stop()
-
-    # AV symbol: for US stocks use same ticker; Saudi not supported by AV
-    is_saudi = raw.endswith(".SR") or (raw.isdigit() and len(raw) in (3,4,5))
-    av_sym   = None if is_saudi else td_sym
 
     st.session_state.result = {
-        "raw": raw, "td_sym": td_sym, "td_ex": td_ex,
-        "av_sym": av_sym, "name": name, "currency": cur,
-        "hist": hist, "is_saudi": is_saudi, "period": sel_period,
+        "symbol":   raw,
+        "info":     info,
+        "hist":     hist,
+        "period":   sel_period,
+        "interval": interval_yf,
     }
 
 # ════════════════════════════════════════════════════════
@@ -292,396 +459,494 @@ if go_btn:
 # ════════════════════════════════════════════════════════
 res = st.session_state.result
 if not res:
-    st.info("👈 Enter a stock symbol and click **Analyze Stock**.")
-    st.markdown("""
-| Market | Examples |
-|--------|---------|
-| NASDAQ / NYSE | `AAPL` `TSLA` `NVDA` `MSFT` `AMZN` `GOOGL` `JPM` |
-| Saudi Tadawul | `2222.SR` `1120.SR` `2010.SR` *(requires Pro plan)* |
-
-**Required API keys** (both free):
-- `TWELVEDATA_API_KEY` → price & charts → [twelvedata.com](https://twelvedata.com)
-- `ALPHAVANTAGE_API_KEY` → fundamentals → [alphavantage.co](https://www.alphavantage.co)
-""")
     st.stop()
 
-raw      = res["raw"]
-td_sym   = res["td_sym"]
-td_ex    = res["td_ex"]
-av_sym   = res["av_sym"]
-name     = res["name"]
-currency = res["currency"]
+symbol   = res["symbol"]
+info     = res["info"]
 hist     = res["hist"]
-is_saudi = res["is_saudi"]
-
-# ── Fetch all data ────────────────────────────────────────
-with st.spinner("Loading quote & fundamentals…"):
-    live_q  = td_quote(td_sym, td_ex)
-    ov      = av_overview(av_sym) if av_sym else {}
-    av_q    = av_quote(av_sym)    if av_sym else {}
-
-    # Only fetch detailed statements if we have the key and symbol
-    if av_sym and _av_key():
-        inc = av_income(av_sym)
-        bal = av_balance(av_sym)
-        cf  = av_cashflow(av_sym)
-    else:
-        inc = bal = cf = {}
-
-if show_debug:
-    with st.expander("🔧 TD quote"):     st.json(live_q)
-    with st.expander("🔧 AV overview"):  st.json(ov)
-    with st.expander("🔧 AV quote"):     st.json(av_q)
-
-# Helper: get latest annual report row
-def _latest(section_key, statement):
-    reps = statement.get(section_key) or []
-    return reps[0] if reps else {}
-
-inc_r = _latest("annualReports", inc)
-bal_r = _latest("annualReports", bal)
-cf_r  = _latest("annualReports", cf)
+currency = info.get("currency", "USD")
+name     = info.get("longName") or info.get("shortName") or symbol
+exchange = info.get("exchange") or info.get("fullExchangeName") or ""
 
 # ── Header ────────────────────────────────────────────────
-c1,c2,c3,c4 = st.columns([2,1,1,1])
-with c1:
-    st.subheader(name)
-    st.caption(f"**{td_sym}** · {td_ex or '—'} · {currency}")
+close_s   = hist["Close"].dropna()
+cur_price = _sf(info.get("currentPrice") or info.get("regularMarketPrice")) or (
+    float(close_s.iloc[-1]) if not close_s.empty else None)
+prev_close = _sf(info.get("previousClose") or info.get("regularMarketPreviousClose"))
 
-close_s = hist["Close"].dropna()
-with c2:
-    if len(close_s) >= 2:
-        cp,pp = float(close_s.iloc[-1]), float(close_s.iloc[-2])
-        d = cp-pp; dp = d/pp*100 if pp else 0
-        st.metric("Current Price", f"{cp:.2f}", f"{d:+.2f} ({dp:+.2f}%)")
+h1, h2, h3, h4, h5 = st.columns([3, 1.5, 1.5, 1.5, 1.5])
+with h1:
+    st.subheader(name)
+    st.caption(f"**{symbol}** · {exchange} · {currency}")
+
+with h2:
+    if cur_price and prev_close:
+        chg  = cur_price - prev_close
+        chgp = chg / prev_close * 100
+        st.metric("Price", f"{cur_price:.2f}", f"{chg:+.2f} ({chgp:+.2f}%)")
+    elif cur_price:
+        st.metric("Price", f"{cur_price:.2f}")
     else:
-        st.metric("Current Price","N/A")
-with c3: st.metric("Period High", f"{float(hist['High'].max()):.2f}")
-with c4: st.metric("Period Low",  f"{float(hist['Low'].min()):.2f}")
+        st.metric("Price", "N/A")
+
+with h3:
+    hi52 = _sf(info.get("fiftyTwoWeekHigh"))
+    st.metric("52W High", f"{hi52:.2f}" if hi52 else "N/A")
+with h4:
+    lo52 = _sf(info.get("fiftyTwoWeekLow"))
+    st.metric("52W Low", f"{lo52:.2f}" if lo52 else "N/A")
+with h5:
+    mktcap = _sf(info.get("marketCap"))
+    st.metric("Market Cap", _money(mktcap))
 
 st.markdown("---")
-tab1, tab2, tab3 = st.tabs(["📊 Price Analysis","💼 Financial Metrics","🔮 AI Forecast"])
+
+# ── Tabs ─────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Price & Technicals",
+    "💼 Fundamentals",
+    "🔮 Forecast",
+    "🤖 AI Analysis",
+])
 
 # ════════════════════════════════════════════════════════
-# TAB 1 — Price Chart
+# TAB 1 — Price Chart + Technical Indicators
 # ════════════════════════════════════════════════════════
 with tab1:
-    st.subheader("Historical Price & Volume")
-    fig = go.Figure()
+    close = hist["Close"].dropna()
+
+    # Calculate indicators
+    sma20  = calc_sma(close, 20)
+    sma50  = calc_sma(close, 50)
+    sma200 = calc_sma(close, 200)
+    rsi    = calc_rsi(close)
+    macd_line, macd_sig, macd_hist_vals = calc_macd(close)
+    bb_up, bb_mid, bb_low = calc_bbands(close)
+
+    # Current RSI and MACD values for AI
+    rsi_current  = float(rsi.dropna().iloc[-1])  if not rsi.dropna().empty  else None
+    macd_current = float(macd_hist_vals.dropna().iloc[-1]) if not macd_hist_vals.dropna().empty else None
+
+    # Store for AI tab
+    st.session_state["rsi_current"]  = rsi_current
+    st.session_state["macd_current"] = macd_current
+
+    # ── Main price chart ─────────────────────────────────
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.6, 0.2, 0.2],
+        subplot_titles=[f"{symbol} Price", "RSI (14)", "MACD"],
+    )
+
+    # Candlestick
     fig.add_trace(go.Candlestick(
-        x=hist.index, open=hist["Open"], high=hist["High"],
-        low=hist["Low"], close=hist["Close"], name="Price",
-        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-    ))
-    if hist["Volume"].sum() > 0:
+        x=hist.index,
+        open=hist["Open"], high=hist["High"],
+        low=hist["Low"],   close=hist["Close"],
+        name="Price",
+        increasing_line_color="#26a69a",
+        decreasing_line_color="#ef5350",
+    ), row=1, col=1)
+
+    # Bollinger Bands
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=bb_up, mode="lines",
+        line=dict(color="rgba(100,180,255,0.3)", width=1),
+        name="BB Upper", showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=bb_low, mode="lines",
+        fill="tonexty", fillcolor="rgba(100,180,255,0.06)",
+        line=dict(color="rgba(100,180,255,0.3)", width=1),
+        name="BB Lower",
+    ), row=1, col=1)
+
+    # Moving averages
+    for sma, label, color in [
+        (sma20,  "SMA 20",  "#f9e2af"),
+        (sma50,  "SMA 50",  "#89b4fa"),
+        (sma200, "SMA 200", "#cba6f7"),
+    ]:
+        if sma.dropna().shape[0] > 5:
+            fig.add_trace(go.Scatter(
+                x=hist.index, y=sma, mode="lines",
+                line=dict(width=1.2, color=color),
+                name=label,
+            ), row=1, col=1)
+
+    # Volume bar
+    if "Volume" in hist.columns and hist["Volume"].sum() > 0:
+        colors = ["#26a69a" if c >= o else "#ef5350"
+                  for c, o in zip(hist["Close"], hist["Open"])]
         fig.add_trace(go.Bar(
-            x=hist.index, y=hist["Volume"], name="Volume",
-            yaxis="y2", opacity=0.25, marker_color="rgba(100,180,255,0.5)"))
+            x=hist.index, y=hist["Volume"],
+            name="Volume", marker_color=colors,
+            opacity=0.4, showlegend=False,
+        ), row=1, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=rsi, mode="lines",
+        line=dict(color="#89b4fa", width=1.5), name="RSI",
+    ), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="#f38ba8",
+                  line_width=1, row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="#a6e3a1",
+                  line_width=1, row=2, col=1)
+    fig.add_hrect(y0=30, y1=70, fillcolor="rgba(137,180,250,0.05)",
+                  line_width=0, row=2, col=1)
+
+    # MACD
+    macd_colors = ["#26a69a" if v >= 0 else "#ef5350"
+                   for v in macd_hist_vals.fillna(0)]
+    fig.add_trace(go.Bar(
+        x=hist.index, y=macd_hist_vals,
+        marker_color=macd_colors, name="MACD Hist",
+        opacity=0.7,
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=macd_line, mode="lines",
+        line=dict(color="#89b4fa", width=1.2), name="MACD",
+    ), row=3, col=1)
+    fig.add_trace(go.Scatter(
+        x=hist.index, y=macd_sig, mode="lines",
+        line=dict(color="#f9e2af", width=1.2), name="Signal",
+    ), row=3, col=1)
+
     fig.update_layout(
-        title=f"{td_sym} — {res['period']}",
-        yaxis_title=f"Price ({currency})",
-        yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
-        xaxis_title="Date", height=600, hovermode="x unified",
-        template="plotly_dark", xaxis_rangeslider_visible=False)
+        template="plotly_dark",
+        height=700,
+        hovermode="x unified",
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=40, r=20, t=40, b=20),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right",  x=1,
+            font=dict(size=11),
+        ),
+    )
+    fig.update_yaxes(title_text=currency, row=1, col=1)
+    fig.update_yaxes(title_text="RSI",    row=2, col=1, range=[0, 100])
+    fig.update_yaxes(title_text="MACD",   row=3, col=1)
+
     st.plotly_chart(fig, use_container_width=True)
 
+    # Technical summary cards
+    st.markdown('<div class="section-header">Technical Summary</div>', unsafe_allow_html=True)
+    tc1, tc2, tc3, tc4, tc5 = st.columns(5)
+
+    rsi_label = "Overbought" if (rsi_current or 50) > 70 else (
+                "Oversold"   if (rsi_current or 50) < 30 else "Neutral")
+    rsi_color = "negative" if (rsi_current or 50) > 70 else (
+                "positive"  if (rsi_current or 50) < 30 else "neutral")
+
+    macd_label = "Bullish" if (macd_current or 0) > 0 else "Bearish"
+    macd_color = "positive" if (macd_current or 0) > 0 else "negative"
+
+    above_200 = bool(cur_price and not sma200.dropna().empty and
+                     cur_price > float(sma200.dropna().iloc[-1]))
+
+    tc1.metric("RSI (14)",   f"{rsi_current:.1f}" if rsi_current else "N/A",
+               delta=rsi_label)
+    tc2.metric("MACD",       f"{macd_current:.3f}" if macd_current else "N/A",
+               delta=macd_label)
+    tc3.metric("SMA 20",     f"{float(sma20.dropna().iloc[-1]):.2f}"  if not sma20.dropna().empty  else "N/A")
+    tc4.metric("SMA 50",     f"{float(sma50.dropna().iloc[-1]):.2f}"  if not sma50.dropna().empty  else "N/A")
+    tc5.metric("Above SMA200", "✅ Yes" if above_200 else "❌ No")
+
 # ════════════════════════════════════════════════════════
-# TAB 2 — Financial Metrics
+# TAB 2 — Fundamentals (all from yfinance .info — works for Saudi too)
 # ════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("Financial Metrics")
+    fins = get_financials(symbol)
+    inc  = fins["income"]
+    bal  = fins["balance"]
+    cf   = fins["cashflow"]
 
-    if is_saudi:
-        st.info(
-            "ℹ️ Fundamental data via Alpha Vantage is not available for Saudi stocks. "
-            "Price chart and live quote are shown above."
-        )
+    # ── Valuation ────────────────────────────────────────
+    st.markdown('<div class="section-header">📊 Valuation</div>', unsafe_allow_html=True)
+    v1, v2, v3, v4 = st.columns(4)
+    v5, v6, v7, v8 = st.columns(4)
 
-    # ── Live Quote ──────────────────────────────────────
-    st.markdown("### 📌 Live Quote")
-    q1,q2,q3,q4 = st.columns(4)
-    q5,q6,q7,q8 = st.columns(4)
+    pe       = _sf(info.get("trailingPE")    or info.get("forwardPE"))
+    fwd_pe   = _sf(info.get("forwardPE"))
+    pb       = _sf(info.get("priceToBook"))
+    ps       = _sf(info.get("priceToSalesTrailing12Months"))
+    ev_ebit  = _sf(info.get("enterpriseToEbitda"))
+    ev_rev   = _sf(info.get("enterpriseToRevenue"))
+    peg      = _sf(info.get("pegRatio"))
+    beta     = _sf(info.get("beta"))
+    eps      = _sf(info.get("trailingEps"))
+    fwd_eps  = _sf(info.get("forwardEps"))
 
-    # TD quote fields
-    td_price   = _sf(live_q.get("close") or live_q.get("price"))
-    td_chg     = _sf(live_q.get("change"))
-    td_chg_pct = _sf(live_q.get("percent_change"))
-    td_open    = _sf(live_q.get("open"))
-    td_hi      = _sf(live_q.get("high"))
-    td_lo      = _sf(live_q.get("low"))
-    td_prev    = _sf(live_q.get("previous_close"))
-    td_vol     = _sf(live_q.get("volume"))
-    td_avg_vol = _sf(live_q.get("average_volume"))
-
-    # AV quote fields (supplements TD)
-    av_price   = _sf(av_q.get("05. price"))
-    av_chg     = _sf(av_q.get("09. change"))
-    av_chg_pct_s = (av_q.get("10. change percent") or "").replace("%","")
-    av_chg_pct = _sf(av_chg_pct_s)
-    av_vol     = _sf(av_q.get("06. volume"))
-    av_open    = _sf(av_q.get("02. open"))
-    av_hi      = _sf(av_q.get("03. high"))
-    av_lo      = _sf(av_q.get("04. low"))
-    av_prev    = _sf(av_q.get("08. previous close"))
-
-    price  = td_price  or av_price  or (float(close_s.iloc[-1]) if len(close_s) else None)
-    chg    = td_chg    or av_chg
-    chgpct = td_chg_pct or av_chg_pct
-    opn    = td_open   or av_open
-    hi_d   = td_hi     or av_hi
-    lo_d   = td_lo     or av_lo
-    prev   = td_prev   or av_prev
-    vol    = td_vol    or av_vol
-    avgvol = td_avg_vol
-
-    delta = f"{chg:+.2f} ({chgpct:+.2f}%)" if chg is not None and chgpct is not None else None
-    q1.metric("Last Price",  f"{price:.2f}"    if price  else "N/A", delta)
-    q2.metric("Open",        _num(opn)          if opn    else "N/A")
-    q3.metric("Day High",    _num(hi_d)         if hi_d   else "N/A")
-    q4.metric("Day Low",     _num(lo_d)         if lo_d   else "N/A")
-    q5.metric("Prev Close",  _num(prev)         if prev   else "N/A")
-    q6.metric("Volume",      f"{int(vol):,}"    if vol    else "N/A")
-    q7.metric("Avg Volume",  f"{int(avgvol):,}" if avgvol else "N/A")
-    q8.metric("Currency",    currency)
+    v1.metric("P/E (Trailing)",   _num(pe)       if pe      else "N/A")
+    v2.metric("P/E (Forward)",    _num(fwd_pe)   if fwd_pe  else "N/A")
+    v3.metric("P/B Ratio",        _num(pb)       if pb      else "N/A")
+    v4.metric("P/S Ratio",        _num(ps)       if ps      else "N/A")
+    v5.metric("EV/EBITDA",        _num(ev_ebit)  if ev_ebit else "N/A")
+    v6.metric("EV/Revenue",       _num(ev_rev)   if ev_rev  else "N/A")
+    v7.metric("PEG Ratio",        _num(peg)      if peg     else "N/A")
+    v8.metric("Beta",             _num(beta)     if beta    else "N/A")
 
     st.markdown("---")
 
-    # ── Valuation (Alpha Vantage OVERVIEW) ──────────────
-    st.markdown("### 📊 Valuation")
-    v1,v2,v3,v4 = st.columns(4)
-    v5,v6,v7,v8 = st.columns(4)
+    # ── Profitability ────────────────────────────────────
+    st.markdown('<div class="section-header">📈 Profitability & Growth</div>', unsafe_allow_html=True)
+    p1, p2, p3, p4 = st.columns(4)
+    p5, p6, p7, p8 = st.columns(4)
 
-    mktcap   = _pick(ov,"MarketCapitalization")
-    pe       = _pick(ov,"TrailingPE","ForwardPE")
-    pb       = _pick(ov,"PriceToBookRatio")
-    ps       = _pick(ov,"PriceToSalesRatioTTM")
-    ev       = _pick(ov,"EVToEBITDA")  # AV gives EV/EBITDA directly
-    peg      = _pick(ov,"PEGRatio")
-    beta     = _pick(ov,"Beta")
-    eps      = _pick(ov,"EPS")
+    rev        = _sf(info.get("totalRevenue"))
+    rev_g      = _sf(info.get("revenueGrowth"))
+    gross_m    = _sf(info.get("grossMargins"))
+    op_m       = _sf(info.get("operatingMargins"))
+    net_m      = _sf(info.get("profitMargins"))
+    ebitda     = _sf(info.get("ebitda"))
+    roe        = _sf(info.get("returnOnEquity"))
+    roa        = _sf(info.get("returnOnAssets"))
 
-    v1.metric("Market Cap",      _money(mktcap))
-    v2.metric("P/E (TTM)",       _num(pe)    if pe    else "N/A")
-    v3.metric("P/B Ratio",       _num(pb)    if pb    else "N/A")
-    v4.metric("P/S Ratio",       _num(ps)    if ps    else "N/A")
-    v5.metric("EV/EBITDA",       _num(ev)    if ev    else "N/A")
-    v6.metric("PEG Ratio",       _num(peg)   if peg   else "N/A")
-    v7.metric("Beta",            _num(beta)  if beta  else "N/A")
-    v8.metric("EPS (TTM)",       _num(eps,"$") if eps else "N/A")
-
-    st.markdown("---")
-
-    # ── Dividends ───────────────────────────────────────
-    st.markdown("### 💰 Dividends")
-    d1,d2,d3,d4 = st.columns(4)
-
-    div_y  = _pick(ov,"DividendYield")
-    div_r  = _pick(ov,"DividendPerShare")
-    payout = _pick(ov,"PayoutRatio")
-    ex_div = _picks(ov,"ExDividendDate")
-
-    d1.metric("Dividend Yield",   _pct(div_y) if div_y else "N/A")
-    d2.metric("Dividend/Share",   _num(div_r,"$") if div_r else "N/A")
-    d3.metric("Payout Ratio",     _pct(payout) if payout else "N/A")
-    d4.metric("Ex-Dividend Date", ex_div or "N/A")
+    p1.metric("Revenue (TTM)",     _money(rev))
+    p2.metric("Revenue Growth",    _pct(rev_g)   if rev_g   else "N/A")
+    p3.metric("Gross Margin",      _pct(gross_m) if gross_m else "N/A")
+    p4.metric("Operating Margin",  _pct(op_m)    if op_m    else "N/A")
+    p5.metric("Net Margin",        _pct(net_m)   if net_m   else "N/A")
+    p6.metric("EBITDA",            _money(ebitda))
+    p7.metric("Return on Equity",  _pct(roe)     if roe     else "N/A")
+    p8.metric("Return on Assets",  _pct(roa)     if roa     else "N/A")
 
     st.markdown("---")
 
-    # ── Financial Performance ────────────────────────────
-    st.markdown("### 📈 Financial Performance")
-    f1,f2,f3,f4 = st.columns(4)
-    f5,f6,f7,f8 = st.columns(4)
+    # ── EPS & Dividends ─────────────────────────────────
+    st.markdown('<div class="section-header">💰 EPS & Dividends</div>', unsafe_allow_html=True)
+    e1, e2, e3, e4 = st.columns(4)
+    e5, e6, e7, e8 = st.columns(4)
 
-    # OVERVIEW has trailing figures
-    rev      = _pick(ov,"RevenueTTM")
-    rev_g    = _pick(ov,"QuarterlyRevenueGrowthYOY")
-    gm       = _pick(ov,"GrossProfitTTM")  # gross profit absolute; compute margin below
-    nm       = _pick(ov,"ProfitMargin")
-    om       = _pick(ov,"OperatingMarginTTM")
-    ebitda   = _pick(ov,"EBITDA")
-    roe      = _pick(ov,"ReturnOnEquityTTM")
-    roa      = _pick(ov,"ReturnOnAssetsTTM")
+    div_y    = _sf(info.get("dividendYield"))
+    div_r    = _sf(info.get("dividendRate"))
+    payout   = _sf(info.get("payoutRatio"))
+    ex_div   = _str(info, "exDividendDate")
+    target_p = _sf(info.get("targetMeanPrice"))
+    target_h = _sf(info.get("targetHighPrice"))
+    target_l = _sf(info.get("targetLowPrice"))
+    rec      = _str(info, "recommendationKey")
 
-    # Gross margin = GrossProfit / Revenue
-    gm_pct = None
-    if gm and rev and rev != 0:
-        gm_pct = gm / rev
-
-    f1.metric("Revenue (TTM)",     _money(rev))
-    f2.metric("Revenue Growth",    _pct(rev_g) if rev_g else "N/A")
-    f3.metric("Gross Margin",      _pct(gm_pct) if gm_pct else "N/A")
-    f4.metric("Net Profit Margin", _pct(nm) if nm else "N/A")
-    f5.metric("EBITDA",            _money(ebitda))
-    f6.metric("Operating Margin",  _pct(om) if om else "N/A")
-    f7.metric("Return on Equity",  _pct(roe) if roe else "N/A")
-    f8.metric("Return on Assets",  _pct(roa) if roa else "N/A")
+    e1.metric("EPS (TTM)",         _num(eps,    "$") if eps     else "N/A")
+    e2.metric("EPS (Forward)",     _num(fwd_eps,"$") if fwd_eps else "N/A")
+    e3.metric("Dividend Yield",    _pct(div_y)       if div_y   else "N/A")
+    e4.metric("Dividend/Share",    _num(div_r,  "$") if div_r   else "N/A")
+    e5.metric("Payout Ratio",      _pct(payout)      if payout  else "N/A")
+    e6.metric("Analyst Target",    _num(target_p,"$")if target_p else "N/A")
+    e7.metric("Target Range",
+              f"${target_l:.2f}–${target_h:.2f}" if target_l and target_h else "N/A")
+    e8.metric("Recommendation",    (rec or "N/A").replace("_", " ").title())
 
     st.markdown("---")
 
-    # ── Balance Sheet (latest annual report) ────────────
-    st.markdown("### 🏦 Balance Sheet")
-    b1,b2,b3,b4 = st.columns(4)
-    b5,b6,b7,b8 = st.columns(4)
+    # ── Balance Sheet ────────────────────────────────────
+    st.markdown('<div class="section-header">🏦 Balance Sheet</div>', unsafe_allow_html=True)
+    b1, b2, b3, b4 = st.columns(4)
+    b5, b6, b7, b8 = st.columns(4)
 
-    cash   = _pick(bal_r,"cashAndCashEquivalentsAtCarryingValue","cashAndShortTermInvestments")
-    debt   = _pick(bal_r,"shortLongTermDebtTotal","longTermDebt")
-    assets = _pick(bal_r,"totalAssets")
-    equity = _pick(bal_r,"totalShareholderEquity")
-    cr     = _pick(ov,"CurrentRatio")
-    qr     = _pick(ov,"QuickRatio")
-    de     = _pick(ov,"DebtToEquityRatio")
-    bv     = _pick(ov,"BookValue")
+    cash       = _sf(info.get("totalCash"))
+    debt       = _sf(info.get("totalDebt"))
+    assets     = latest_val(bal, "Total Assets")
+    equity_v   = _sf(info.get("bookValue"))
+    shares     = _sf(info.get("sharesOutstanding"))
+    cr         = _sf(info.get("currentRatio"))
+    qr         = _sf(info.get("quickRatio"))
+    de         = _sf(info.get("debtToEquity"))
 
-    b1.metric("Total Cash",       _money(cash))
-    b2.metric("Total Debt",       _money(debt))
-    b3.metric("Total Assets",     _money(assets))
-    b4.metric("Shareholders Eq.", _money(equity))
-    b5.metric("Current Ratio",    _num(cr)     if cr  else "N/A")
-    b6.metric("Quick Ratio",      _num(qr)     if qr  else "N/A")
-    b7.metric("Debt / Equity",    _num(de)     if de  else "N/A")
-    b8.metric("Book Value/Share", _num(bv,"$") if bv  else "N/A")
+    b1.metric("Total Cash",        _money(cash))
+    b2.metric("Total Debt",        _money(debt))
+    b3.metric("Book Value/Share",  _num(equity_v, "$") if equity_v else "N/A")
+    b4.metric("Shares Outstanding",_money(shares).replace("$","") if shares else "N/A")
+    b5.metric("Current Ratio",     _num(cr)    if cr  else "N/A")
+    b6.metric("Quick Ratio",       _num(qr)    if qr  else "N/A")
+    b7.metric("Debt/Equity",       _num(de)    if de  else "N/A")
+    b8.metric("Cash/Share",        _num(_sf(info.get("totalCashPerShare")), "$")
+              if info.get("totalCashPerShare") else "N/A")
 
     st.markdown("---")
 
     # ── Cash Flow ────────────────────────────────────────
-    st.markdown("### 💵 Cash Flow")
-    c1f,c2f,c3f,c4f = st.columns(4)
+    st.markdown('<div class="section-header">💵 Cash Flow</div>', unsafe_allow_html=True)
+    c1f, c2f, c3f, c4f = st.columns(4)
 
-    op_cf  = _pick(cf_r,"operatingCashflow")
-    capex  = _pick(cf_r,"capitalExpenditures")
-    fcf    = None
-    if op_cf and capex:
-        fcf = op_cf - abs(capex)
-    div_cf = _pick(cf_r,"dividendPayout")
+    op_cf  = _sf(info.get("operatingCashflow"))
+    fcf    = _sf(info.get("freeCashflow"))
+    capex  = (op_cf - fcf) if (op_cf and fcf) else None
 
-    c1f.metric("Operating CF",   _money(op_cf))
-    c2f.metric("CapEx",          _money(capex))
-    c3f.metric("Free Cash Flow", _money(fcf))
-    c4f.metric("Dividends Paid", _money(div_cf))
+    # Fallback from statements
+    if op_cf is None:
+        op_cf = latest_val(cf, "Operating Cash Flow", "Cash Flow From Continuing Operating Activities")
+    if fcf is None:
+        fcf = latest_val(cf, "Free Cash Flow")
+
+    c1f.metric("Operating CF",    _money(op_cf))
+    c2f.metric("Free Cash Flow",  _money(fcf))
+    c3f.metric("CapEx",           _money(capex))
+    c4f.metric("FCF Yield",
+               _pct(_sf(fcf) / mktcap) if (fcf and mktcap) else "N/A")
 
     st.markdown("---")
 
-    # ── 52-Week & Analyst ─────────────────────────────────
-    st.markdown("### 📅 52-Week Range & Analyst Targets")
-    w1,w2,w3,w4 = st.columns(4)
-    w5,w6,w7,w8 = st.columns(4)
+    # ── Company Info ─────────────────────────────────────
+    st.markdown('<div class="section-header">🏢 Company Profile</div>', unsafe_allow_html=True)
+    i1, i2, i3, i4 = st.columns(4)
 
-    hi52   = _pick(ov,"52WeekHigh")
-    lo52   = _pick(ov,"52WeekLow")
-    target = _pick(ov,"AnalystTargetPrice")
-    shares = _pick(ov,"SharesOutstanding")
-    sect   = _picks(ov,"Sector")
-    ind    = _picks(ov,"Industry")
-    emp    = _pick(ov,"FullTimeEmployees")
-    exch   = _picks(ov,"Exchange")
+    sector   = _str(info, "sector")
+    industry = _str(info, "industry")
+    country  = _str(info, "country")
+    emp      = _sf(info.get("fullTimeEmployees"))
+    website  = _str(info, "website")
+    hq_city  = _str(info, "city")
 
-    # Fallback 52w from price history
-    if hi52 is None and not hist.empty:
-        sub  = hist[hist.index >= hist.index.max()-pd.Timedelta(days=365)]
-        if not sub.empty:
-            hi52 = float(sub["High"].max())
-            lo52 = float(sub["Low"].min())
+    i1.metric("Sector",    sector   or "N/A")
+    i2.metric("Industry",  industry or "N/A")
+    i3.metric("Country",   country  or "N/A")
+    i4.metric("Employees", f"{int(emp):,}" if emp else "N/A")
 
-    w1.metric("52-Week High",       f"{hi52:.2f}"   if hi52   else "N/A")
-    w2.metric("52-Week Low",        f"{lo52:.2f}"   if lo52   else "N/A")
-    w3.metric("Analyst Target",     f"{target:.2f}" if target else "N/A")
-    w4.metric("Shares Outstanding", _money(shares).replace("$","") if shares else "N/A")
-    w5.metric("Sector",             sect or "N/A")
-    w6.metric("Industry",           ind  or "N/A")
-    w7.metric("Exchange",           exch or td_ex or "N/A")
-    w8.metric("Employees",          f"{int(emp):,}" if emp else "N/A")
-
-    # No-data note
-    if not any([mktcap, pe, rev, eps]) and not is_saudi:
-        if not _av_key():
-            st.warning(
-                "⚠️ **ALPHAVANTAGE_API_KEY** is missing — fundamental data cannot be loaded.\n\n"
-                "Get a free key at [alphavantage.co](https://www.alphavantage.co/support/#api-key) "
-                "and add it to **Settings → Secrets**:\n"
-                "```\nALPHAVANTAGE_API_KEY = \"your_key_here\"\n```"
-            )
-        else:
-            st.info(
-                "ℹ️ Fundamental data returned empty. "
-                "Alpha Vantage free plan allows **25 requests/day**. "
-                "You may have reached the daily limit — try again tomorrow, or "
-                "upgrade at [alphavantage.co/premium](https://www.alphavantage.co/premium/)."
-            )
+    if info.get("longBusinessSummary"):
+        with st.expander("Business Summary"):
+            st.write(info["longBusinessSummary"])
 
 # ════════════════════════════════════════════════════════
-# TAB 3 — AI Forecast
+# TAB 3 — ARIMA Forecast
 # ════════════════════════════════════════════════════════
 with tab3:
-    st.subheader("🔮 AI-Powered Price Forecast")
-    horizon = st.slider("Forecast horizon (days)", 7, 90, 30, 1)
+    st.markdown("### 🔮 Price Forecast")
+    st.caption("Uses ARIMA(1,1,1) on log-prices. Confidence intervals shown. Not financial advice.")
 
-    cdf = (hist.reset_index()
-               .rename(columns={hist.index.name or "index": "Date"})
-               [["Date","Close"]].dropna())
+    close_clean = hist["Close"].dropna()
 
-    if cdf.empty or cdf["Close"].nunique() < 10:
-        st.warning("Not enough data to forecast.")
+    col_h, col_m = st.columns([3, 1])
+    with col_h:
+        horizon = st.slider("Forecast horizon (trading days)", 7, 90, 30, 1)
+    with col_m:
+        show_ci = st.checkbox("Show confidence interval", value=True)
+
+    if len(close_clean) < 30:
+        st.warning("Not enough data for a reliable forecast. Try a longer time period.")
     else:
-        use_p = True
-        try:
-            from prophet import Prophet
-        except Exception:
-            use_p = False
+        with st.spinner("Running ARIMA model…"):
+            fc_df = arima_forecast(close_clean, horizon)
+            st.session_state["fc_df"] = fc_df
 
-        if use_p:
-            try:
-                st.info("Using Prophet forecasting ✅")
-                dfp = cdf.rename(columns={"Date":"ds","Close":"y"})
-                dfp["ds"] = pd.to_datetime(dfp["ds"]).dt.tz_localize(None)
-                m  = Prophet(daily_seasonality=False,
-                             weekly_seasonality=True, yearly_seasonality=True)
-                m.fit(dfp)
-                fc = m.predict(m.make_future_dataframe(periods=horizon))
-                ld = dfp["ds"].max()
-                fig = go.Figure([
-                    go.Scatter(x=dfp["ds"], y=dfp["y"], mode="lines", name="Actual"),
-                    go.Scatter(x=fc["ds"],  y=fc["yhat"], mode="lines", name="Forecast"),
-                    go.Scatter(x=fc["ds"],  y=fc["yhat_upper"], mode="lines",
-                               line=dict(width=0), showlegend=False, hoverinfo="skip"),
-                    go.Scatter(x=fc["ds"],  y=fc["yhat_lower"], mode="lines",
-                               fill="tonexty", fillcolor="rgba(100,180,255,0.15)",
-                               line=dict(width=0), showlegend=False, hoverinfo="skip"),
-                ])
-                fig.update_layout(title=f"{td_sym} — {horizon}-day Forecast",
-                    xaxis_title="Date", yaxis_title=f"Price ({currency})",
-                    height=550, hovermode="x unified", template="plotly_dark")
-                st.plotly_chart(fig, use_container_width=True)
-                tbl = fc[fc["ds"]>ld][["ds","yhat","yhat_lower","yhat_upper"]]
-                tbl.columns = ["Date","Forecast","Low CI","High CI"]
-                st.dataframe(tbl.tail(30), use_container_width=True)
-            except Exception as e:
-                st.warning(f"Prophet error: {e} — falling back to linear trend.")
-                use_p = False
+        last_date = close_clean.index[-1]
 
-        if not use_p:
-            st.info("Using linear trend forecast ✅")
-            y    = cdf["Close"].values.astype(float)
-            x    = np.arange(len(y), dtype=float)
-            coef = np.polyfit(x, y, 1)
-            tr   = np.poly1d(coef)
-            xa   = np.arange(len(y)+horizon, dtype=float)
-            yhat = tr(xa)
-            ld   = pd.to_datetime(cdf["Date"].max())
-            fd   = pd.date_range(ld, periods=horizon+1, freq="D")[1:]
-            ad   = pd.concat([pd.to_datetime(cdf["Date"]),
-                               pd.Series(fd)], ignore_index=True)
-            fig  = go.Figure([
-                go.Scatter(x=pd.to_datetime(cdf["Date"]), y=cdf["Close"],
-                           mode="lines", name="Actual"),
-                go.Scatter(x=ad, y=yhat, mode="lines", name="Trend",
-                           line=dict(dash="dash", color="orange")),
-            ])
-            fig.update_layout(title=f"{td_sym} — {horizon}-day Trend Forecast",
-                xaxis_title="Date", yaxis_title=f"Price ({currency})",
-                height=550, hovermode="x unified", template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
+        fig2 = go.Figure()
 
-    st.caption("⚠️ Forecasts are experimental. Not financial advice.")
+        # Historical
+        fig2.add_trace(go.Scatter(
+            x=close_clean.index, y=close_clean,
+            mode="lines", name="Actual",
+            line=dict(color="#89b4fa", width=1.5),
+        ))
+
+        # Confidence interval fill
+        if show_ci:
+            fig2.add_trace(go.Scatter(
+                x=pd.concat([fc_df["Date"], fc_df["Date"][::-1]]),
+                y=pd.concat([fc_df["High CI"], fc_df["Low CI"][::-1]]),
+                fill="toself",
+                fillcolor="rgba(166,227,161,0.15)",
+                line=dict(color="rgba(255,255,255,0)"),
+                name="95% CI",
+                showlegend=True,
+            ))
+
+        # Forecast line
+        fig2.add_trace(go.Scatter(
+            x=fc_df["Date"], y=fc_df["Forecast"],
+            mode="lines", name="Forecast",
+            line=dict(color="#a6e3a1", width=2, dash="dash"),
+        ))
+
+        # Vertical marker at today
+        fig2.add_vline(
+            x=last_date, line_dash="dot",
+            line_color="rgba(255,255,255,0.3)", line_width=1,
+        )
+
+        fig2.update_layout(
+            template="plotly_dark",
+            height=500,
+            hovermode="x unified",
+            xaxis_title="Date",
+            yaxis_title=f"Price ({currency})",
+            margin=dict(l=40, r=20, t=20, b=40),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # Summary metrics
+        fc_end    = float(fc_df["Forecast"].iloc[-1])
+        fc_low    = float(fc_df["Low CI"].iloc[-1])
+        fc_high   = float(fc_df["High CI"].iloc[-1])
+        cur       = float(close_clean.iloc[-1])
+        upside    = (fc_end / cur - 1) * 100
+
+        fm1, fm2, fm3, fm4 = st.columns(4)
+        fm1.metric("Current Price",    f"{cur:.2f} {currency}")
+        fm2.metric(f"{horizon}d Target", f"{fc_end:.2f}",
+                   delta=f"{upside:+.1f}%",
+                   delta_color="normal")
+        fm3.metric("CI Low",           f"{fc_low:.2f}")
+        fm4.metric("CI High",          f"{fc_high:.2f}")
+
+        # Forecast table
+        with st.expander("Forecast table"):
+            tbl = fc_df.copy()
+            tbl["Date"] = tbl["Date"].dt.strftime("%Y-%m-%d")
+            for col in ["Forecast", "Low CI", "High CI"]:
+                tbl[col] = tbl[col].round(2)
+            st.dataframe(tbl, use_container_width=True)
+
+    st.warning("⚠️ Forecasts are statistical models based on historical price patterns only. "
+               "They do not account for news, earnings, or market conditions. Not financial advice.")
+
+# ════════════════════════════════════════════════════════
+# TAB 4 — AI Narrative
+# ════════════════════════════════════════════════════════
+with tab4:
+    st.markdown("### 🤖 AI Investment Analysis")
+
+    rsi_c  = st.session_state.get("rsi_current")
+    macd_c = st.session_state.get("macd_current")
+    fc_d   = st.session_state.get("fc_df")
+
+    has_ai_key = False
+    try:
+        has_ai_key = bool(
+            st.secrets.get("ANTHROPIC_API_KEY") or
+            st.secrets.get("OPENAI_API_KEY")
+        )
+    except Exception:
+        pass
+
+    if not has_ai_key:
+        st.info(
+            "**AI narrative requires an API key.**\n\n"
+            "Add one of these to **Settings → Secrets**:\n"
+            "```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```\n"
+            "or\n"
+            "```\nOPENAI_API_KEY = \"sk-...\"\n```\n\n"
+            "Once added, the AI will generate a CFA-level analysis of the stock "
+            "combining fundamentals, technicals, and the forecast above."
+        )
+    else:
+        if st.button("🤖 Generate AI Analysis", type="primary"):
+            with st.spinner("Generating CFA-level analysis…"):
+                narrative = get_ai_narrative(
+                    symbol, name, info, fc_d, rsi_c, macd_c
+                )
+            if narrative:
+                st.markdown(narrative)
+                st.caption("⚠️ AI-generated analysis. Not financial advice. "
+                           "Always do your own research.")
+            else:
+                st.error("AI analysis failed. Check your API key in Secrets.")
 
 st.markdown("---")
-st.caption("⚠️ Educational purposes only. Not financial advice.")
+st.caption("⚠️ Educational purposes only. Not financial advice. Data from Yahoo Finance.")
