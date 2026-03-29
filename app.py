@@ -204,28 +204,75 @@ def calc_bb(s, p=20, n=2):
 # ════════════════════════════════════════════════════════
 # FORECAST
 # ════════════════════════════════════════════════════════
-def arima_forecast(series: pd.Series, horizon: int) -> pd.DataFrame:
+def ensemble_forecast(series: pd.Series, horizon: int) -> pd.DataFrame:
+    """
+    Ensemble forecast combining 3 models:
+      1. ARIMA(1,1,1)  — short-term autocorrelation
+      2. Exponential Smoothing (Holt) — captures trend drift
+      3. Monte Carlo simulation — captures real historical volatility
+
+    Final forecast = equal-weight average of all three.
+    CI is derived from Monte Carlo percentiles (5th / 95th).
+    This avoids the flat-line problem of pure ARIMA on low-drift series.
+    """
+    y     = series.values.astype(float)
+    last  = y[-1]
+    dates = pd.bdate_range(series.index[-1], periods=horizon + 1)[1:]
+
+    # ── Model 1: ARIMA on log-prices ─────────────────────
+    arima_fc = None
     try:
         from statsmodels.tsa.arima.model import ARIMA
-        log_s = np.log(series.values.astype(float))
-        fit   = ARIMA(log_s, order=(1, 1, 1)).fit()
-        fc    = fit.get_forecast(steps=horizon)
-        mean  = np.exp(fc.predicted_mean)
-        ci    = np.exp(fc.conf_int(alpha=0.05))
-        dates = pd.bdate_range(series.index[-1], periods=horizon + 1)[1:]
-        return pd.DataFrame({"Date": dates, "Forecast": mean,
-                              "Low CI": ci[:, 0], "High CI": ci[:, 1]})
+        log_s    = np.log(y)
+        fit      = ARIMA(log_s, order=(1, 1, 1)).fit()
+        raw      = fit.get_forecast(steps=horizon).predicted_mean
+        arima_fc = np.exp(raw)
     except Exception:
-        pass
-    y     = series.values.astype(float)
-    x     = np.arange(len(y), dtype=float)
-    coef  = np.polyfit(x, y, 1)
-    xa    = np.arange(len(y), len(y) + horizon, dtype=float)
-    yhat  = np.poly1d(coef)(xa)
-    std   = float(np.std(y[-min(30, len(y)):]))
-    dates = pd.bdate_range(series.index[-1], periods=horizon + 1)[1:]
-    return pd.DataFrame({"Date": dates, "Forecast": yhat,
-                          "Low CI": yhat - 1.96*std, "High CI": yhat + 1.96*std})
+        arima_fc = np.full(horizon, last)
+
+    # ── Model 2: Holt's Linear Trend (double exp smoothing) ──
+    holt_fc = None
+    try:
+        from statsmodels.tsa.holtwinters import Holt
+        fit2    = Holt(y, initialization_method="estimated").fit(
+                      optimized=True, remove_bias=True)
+        holt_fc = fit2.forecast(horizon)
+    except Exception:
+        # Manual fallback: use recent slope
+        recent  = y[-min(20, len(y)):]
+        slope   = (recent[-1] - recent[0]) / len(recent)
+        holt_fc = np.array([last + slope * (i + 1) for i in range(horizon)])
+
+    # ── Model 3: Monte Carlo (log-normal random walk) ────
+    # Use last 60 days of log-returns for vol estimation
+    log_rets  = np.diff(np.log(y[-min(60, len(y)):]))
+    mu_daily  = float(np.mean(log_rets))
+    sig_daily = float(np.std(log_rets))
+
+    np.random.seed(42)
+    n_sims    = 500
+    sim_paths = np.zeros((n_sims, horizon))
+    for i in range(n_sims):
+        shocks          = np.random.normal(mu_daily, sig_daily, horizon)
+        log_path        = np.cumsum(shocks)
+        sim_paths[i]    = last * np.exp(log_path)
+
+    mc_mean  = sim_paths.mean(axis=0)
+    ci_low   = np.percentile(sim_paths,  5, axis=0)
+    ci_high  = np.percentile(sim_paths, 95, axis=0)
+
+    # ── Ensemble: equal-weight average ───────────────────
+    ensemble = (arima_fc + holt_fc + mc_mean) / 3.0
+
+    return pd.DataFrame({
+        "Date":     dates,
+        "Forecast": ensemble,
+        "ARIMA":    arima_fc,
+        "Holt":     holt_fc,
+        "MonteCarlo": mc_mean,
+        "Low CI":   ci_low,
+        "High CI":  ci_high,
+    })
 
 # ════════════════════════════════════════════════════════
 # AI NARRATIVE
@@ -386,7 +433,7 @@ if not go_btn and not st.session_state.result:
 | 📊 Price chart | Candlestick + Volume + Bollinger Bands + Moving Averages |
 | 📉 Technicals | RSI + MACD (multi-panel interactive chart) |
 | 💼 Fundamentals | P/E, EV/EBITDA, margins, balance sheet, cash flow |
-| 🔮 Forecast | ARIMA model with 95% confidence band |
+| 🔮 Forecast | Ensemble: ARIMA + Holt Trend + Monte Carlo with 5–95% confidence band |
 | 🤖 AI Analysis | CFA-level narrative (add API key to activate) |
 
 🇺🇸 US Markets · 🇸🇦 Saudi Tadawul · 🌍 Most global exchanges
@@ -645,59 +692,129 @@ with tab2:
 # TAB 3
 # ════════════════════════════════════════════════════════
 with tab3:
-    hdr("🔮 ARIMA Price Forecast")
-    st.caption("ARIMA(1,1,1) on log-prices with 95% confidence intervals. Not financial advice.")
+    hdr("🔮 Ensemble Price Forecast")
+    st.caption(
+        "3-model ensemble: ARIMA (autocorrelation) + Holt Trend (drift) + "
+        "Monte Carlo simulation (volatility). CI = 5th–95th percentile of 500 simulations."
+    )
 
-    fh_c, ci_c = st.columns([3, 1])
+    fh_c, ci_c, ind_c = st.columns([3, 1, 1])
     with fh_c:
         horizon = st.slider("Forecast horizon (trading days)", 7, 90, 30)
     with ci_c:
-        show_ci = st.checkbox("Show 95% CI", value=True)
+        show_ci = st.checkbox("Show CI band", value=True)
+    with ind_c:
+        show_models = st.checkbox("Show models", value=False)
 
     if len(close_s) < 20:
         st.warning("Need at least 20 data points. Select a longer time period.")
     else:
-        with st.spinner("Running ARIMA model…"):
-            fc_df = arima_forecast(close_s, horizon)
+        with st.spinner("Running ensemble model (ARIMA + Holt + Monte Carlo)…"):
+            fc_df = ensemble_forecast(close_s, horizon)
             st.session_state["fc_df"] = fc_df
 
         fig2 = go.Figure()
-        fig2.add_trace(go.Scatter(x=close_s.index, y=close_s, mode="lines",
-            name="Actual", line=dict(color="#89b4fa", width=1.8)))
+
+        # Actual price
+        fig2.add_trace(go.Scatter(
+            x=close_s.index, y=close_s, mode="lines",
+            name="Actual", line=dict(color="#89b4fa", width=1.8),
+        ))
+
+        # CI band (Monte Carlo 5–95th percentile)
         if show_ci and fc_df is not None:
             fig2.add_trace(go.Scatter(
                 x=list(fc_df["Date"]) + list(fc_df["Date"])[::-1],
                 y=list(fc_df["High CI"]) + list(fc_df["Low CI"])[::-1],
-                fill="toself", fillcolor="rgba(166,227,161,0.15)",
-                line=dict(color="rgba(0,0,0,0)"), name="95% CI"))
+                fill="toself", fillcolor="rgba(166,227,161,0.12)",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="5–95% Range", hoverinfo="skip",
+            ))
+
+        # Individual model lines (optional)
+        if show_models and fc_df is not None:
+            fig2.add_trace(go.Scatter(
+                x=fc_df["Date"], y=fc_df["ARIMA"], mode="lines",
+                name="ARIMA", line=dict(color="#f38ba8", width=1.2, dash="dot"),
+            ))
+            fig2.add_trace(go.Scatter(
+                x=fc_df["Date"], y=fc_df["Holt"], mode="lines",
+                name="Holt Trend", line=dict(color="#f9e2af", width=1.2, dash="dot"),
+            ))
+            fig2.add_trace(go.Scatter(
+                x=fc_df["Date"], y=fc_df["MonteCarlo"], mode="lines",
+                name="Monte Carlo", line=dict(color="#cba6f7", width=1.2, dash="dot"),
+            ))
+
+        # Ensemble (main forecast line)
         if fc_df is not None:
-            fig2.add_trace(go.Scatter(x=fc_df["Date"], y=fc_df["Forecast"],
-                mode="lines", name="ARIMA Forecast",
-                line=dict(color="#a6e3a1", width=2.2, dash="dash")))
-        fig2.add_vline(x=close_s.index[-1],
-                       line_dash="dot", line_color="rgba(255,255,255,0.25)")
-        fig2.update_layout(template="plotly_dark", height=480, hovermode="x unified",
+            fig2.add_trace(go.Scatter(
+                x=fc_df["Date"], y=fc_df["Forecast"], mode="lines",
+                name="Ensemble Forecast",
+                line=dict(color="#a6e3a1", width=2.5, dash="dash"),
+            ))
+
+        # Today marker
+        fig2.add_vline(
+            x=close_s.index[-1],
+            line_dash="dot", line_color="rgba(255,255,255,0.3)", line_width=1,
+        )
+        fig2.add_annotation(
+            x=close_s.index[-1], y=float(close_s.iloc[-1]),
+            text="Today", showarrow=True, arrowhead=2,
+            font=dict(color="#cdd6f4", size=11),
+            arrowcolor="#cdd6f4", ax=40, ay=-30,
+        )
+
+        fig2.update_layout(
+            template="plotly_dark", height=500,
+            hovermode="x unified",
             xaxis_title="Date", yaxis_title=f"Price ({currency})",
-            margin=dict(l=40, r=20, t=20, b=40))
+            margin=dict(l=40, r=20, t=20, b=40),
+            legend=dict(orientation="h", yanchor="bottom",
+                        y=1.02, xanchor="right", x=1),
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
         if fc_df is not None and not fc_df.empty:
             cur    = float(close_s.iloc[-1])
             fc_end = float(fc_df["Forecast"].iloc[-1])
             up     = (fc_end / cur - 1) * 100
-            fm1,fm2,fm3,fm4 = st.columns(4)
+            ci_lo  = float(fc_df["Low CI"].iloc[-1])
+            ci_hi  = float(fc_df["High CI"].iloc[-1])
+            ci_rng = ((ci_hi - ci_lo) / cur) * 100
+
+            fm1, fm2, fm3, fm4, fm5 = st.columns(5)
             fm1.metric("Current Price",        f"{cur:.2f} {currency}")
             fm2.metric(f"{horizon}d Forecast", f"{fc_end:.2f}",
                        delta=f"{up:+.1f}%")
-            fm3.metric("CI Low",  f"{float(fc_df['Low CI'].iloc[-1]):.2f}")
-            fm4.metric("CI High", f"{float(fc_df['High CI'].iloc[-1]):.2f}")
-            with st.expander("Forecast table"):
-                tbl = fc_df.copy()
+            fm3.metric("5th Pct (bear)",  f"{ci_lo:.2f}",
+                       delta=f"{((ci_lo/cur)-1)*100:+.1f}%")
+            fm4.metric("95th Pct (bull)", f"{ci_hi:.2f}",
+                       delta=f"{((ci_hi/cur)-1)*100:+.1f}%")
+            fm5.metric("Uncertainty Range", f"±{ci_rng/2:.1f}%")
+
+            # Model breakdown
+            st.markdown("**Model breakdown at forecast end:**")
+            mb1, mb2, mb3 = st.columns(3)
+            mb1.metric("ARIMA",       f"{float(fc_df['ARIMA'].iloc[-1]):.2f}",
+                       delta=f"{((float(fc_df['ARIMA'].iloc[-1])/cur)-1)*100:+.1f}%")
+            mb2.metric("Holt Trend",  f"{float(fc_df['Holt'].iloc[-1]):.2f}",
+                       delta=f"{((float(fc_df['Holt'].iloc[-1])/cur)-1)*100:+.1f}%")
+            mb3.metric("Monte Carlo", f"{float(fc_df['MonteCarlo'].iloc[-1]):.2f}",
+                       delta=f"{((float(fc_df['MonteCarlo'].iloc[-1])/cur)-1)*100:+.1f}%")
+
+            with st.expander("Full forecast table"):
+                tbl = fc_df[["Date","Forecast","ARIMA","Holt",
+                              "MonteCarlo","Low CI","High CI"]].copy()
                 tbl["Date"] = tbl["Date"].dt.strftime("%Y-%m-%d")
-                for c in ["Forecast","Low CI","High CI"]: tbl[c] = tbl[c].round(2)
+                for c in tbl.columns[1:]: tbl[c] = tbl[c].round(2)
                 st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-    st.warning("⚠️ Statistical model only. Does not account for news or events. Not financial advice.")
+    st.warning(
+        "⚠️ Statistical models based on historical price patterns only. "
+        "They do not account for earnings, news, or macro events. Not financial advice."
+    )
 
 # ════════════════════════════════════════════════════════
 # TAB 4 — AI (always shown, graceful if no key)
