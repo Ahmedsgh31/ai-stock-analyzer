@@ -387,17 +387,16 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
 
     # ── 3. Google Gemini (FREE tier) ─────────────────────
     if keys["gemini"]:
-        # Try models in order — 1.5-flash has most reliable free quota
         gemini_models = [
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
+            "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
+            "gemini-1.5-flash-8b",
         ]
         last_err = "unknown"
         for model in gemini_models:
             try:
                 r = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"https://generativelanguage.googleapis.com/v1/models/"
                     f"{model}:generateContent?key={keys['gemini']}",
                     headers={"Content-Type": "application/json"},
                     json={
@@ -414,14 +413,17 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                     text = d["candidates"][0]["content"]["parts"][0]["text"]
                     return text, f"Gemini ({model})"
                 last_err = d.get("error", {}).get("message", str(d))
-                # If quota exceeded on this model, try next
                 if "quota" in last_err.lower() or "limit" in last_err.lower():
+                    continue
+                if "not found" in last_err.lower() or "not supported" in last_err.lower():
                     continue
                 return None, f"gemini_error: {last_err}"
             except Exception as e:
                 last_err = str(e)
                 continue
-        return None, f"gemini_quota: {last_err[:200]}"
+        return None, f"gemini_failed: {last_err[:200]}"
+
+    return None, "no_provider"
 
 # ════════════════════════════════════════════════════════
 # SIDEBAR
