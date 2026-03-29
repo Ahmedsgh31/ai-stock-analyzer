@@ -368,18 +368,7 @@ Interpret RSI at {rsi_txt} ({rsi_lbl}) and MACD ({macd_txt}) for near-term direc
 - **Catalyst 1:** [name it, explain specifically how it could drive the stock higher]
 - **Catalyst 2:** [name it, explain specifically how it could drive the stock higher]
 
-**⚖️ VERDICT:** [One decisive, bold concluding sentence for an investor deciding today]
-
----
-## التحليل بالعربية
----
-
-الآن قم بترجمة التحليل الكامل أعلاه إلى اللغة العربية الفصحى المالية الرسمية.
-ترجم جميع الأقسام الستة كاملةً مع جميع العناوين ونقاط البيانات والأرقام والحكم النهائي.
-احتفظ بجميع الأرقام والرموز (مثل {symbol}، {price} {currency}) كما هي بدون ترجمة.
-استخدم المصطلحات المالية العربية الصحيحة. لا تختصر أي قسم.
-
-ابدأ كل قسم بنفس رقم وعنوان القسم الإنجليزي مترجماً إلى العربية."""
+**⚖️ VERDICT:** [One decisive, bold concluding sentence for an investor deciding today]"""
 
     return prompt
 
@@ -501,7 +490,7 @@ Rules:
 TEXT TO TRANSLATE:
 {english_text}"""
 
-    arabic_text, _ = _call_provider(keys, arabic_prompt, max_tokens=4096)
+    arabic_text, _ = _call_provider(keys, arabic_prompt, max_tokens=8192)
     # Arabic is best-effort — if it fails, we still return the English
     return english_text, arabic_text, provider
 
@@ -1031,16 +1020,36 @@ Get key: [platform.openai.com](https://platform.openai.com)
                 if arabic_text:
                     with arab_placeholder.container():
                         st.markdown("---")
-                        # RTL styling for Arabic
+                        # Clean up the header line — render it as proper markdown
+                        arabic_clean = arabic_text.strip()
+                        # Remove raw ## header if present — we render it ourselves
+                        if arabic_clean.startswith("## التحليل بالعربية"):
+                            arabic_clean = arabic_clean[len("## التحليل بالعربية"):].strip()
+                        elif arabic_clean.startswith("## "):
+                            arabic_clean = arabic_clean.split("\n", 1)[-1].strip()
+
+                        st.markdown("## التحليل بالعربية")
+
+                        # Render body RTL with proper formatting
+                        # Convert **bold** markdown to HTML <strong>
+                        import re
+                        arabic_html = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", arabic_clean)
+                        # Convert newlines to <br>
+                        arabic_html = arabic_html.replace("\n\n", "<br><br>").replace("\n", "<br>")
+
                         st.markdown(
-                            '<div dir="rtl" style="text-align:right; '
-                            'font-family: Arial, sans-serif; '
-                            'font-size: 1rem; line-height: 1.9; '
-                            'background: rgba(137,180,250,0.06); '
-                            'border-right: 3px solid #89b4fa; '
-                            'padding: 20px 24px; border-radius: 8px;">'
-                            + arabic_text.replace("\n", "<br>") +
-                            '</div>',
+                            f'<div dir="rtl" style="'
+                            f'text-align: right; '
+                            f'font-family: Arial, Tahoma, sans-serif; '
+                            f'font-size: 1rem; '
+                            f'line-height: 2.0; '
+                            f'background: rgba(137,180,250,0.06); '
+                            f'border-right: 3px solid #89b4fa; '
+                            f'padding: 24px 28px 24px 16px; '
+                            f'border-radius: 8px; '
+                            f'margin-top: 8px;">'
+                            f'{arabic_html}'
+                            f'</div>',
                             unsafe_allow_html=True,
                         )
                         st.markdown("---")
