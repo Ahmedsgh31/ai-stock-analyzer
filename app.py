@@ -129,27 +129,49 @@ def fetch_history(symbol: str, period: str, interval: str) -> pd.DataFrame:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_info(symbol: str) -> dict:
     import yfinance as yf
-    try:
-        t    = yf.Ticker(symbol)
-        info = t.info
-        if info and isinstance(info, dict) and len(info) > 5:
-            return info
-    except Exception:
-        pass
-    # fast_info fallback
+
+    # Try up to 3 times with backoff — Yahoo Finance rate-limits aggressively
+    for attempt in range(3):
+        try:
+            t    = yf.Ticker(symbol)
+            info = t.info
+            # Valid info has many keys including trailingPE, marketCap etc.
+            if info and isinstance(info, dict) and len(info) > 10:
+                # Check we actually got real data not just metadata
+                has_data = any(info.get(k) for k in [
+                    "trailingPE", "forwardPE", "marketCap", "totalRevenue",
+                    "profitMargins", "currentPrice", "regularMarketPrice"
+                ])
+                if has_data:
+                    return info
+        except Exception:
+            pass
+        time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+
+    # fast_info fallback — always works, gives price data at minimum
     try:
         t  = yf.Ticker(symbol)
         fi = t.fast_info
-        return {
-            "currentPrice":        getattr(fi, "last_price",     None),
-            "previousClose":       getattr(fi, "previous_close", None),
-            "fiftyTwoWeekHigh":    getattr(fi, "year_high",      None),
-            "fiftyTwoWeekLow":     getattr(fi, "year_low",       None),
-            "marketCap":           getattr(fi, "market_cap",     None),
+        base = {
+            "currentPrice":        getattr(fi, "last_price",        None),
+            "previousClose":       getattr(fi, "previous_close",    None),
+            "fiftyTwoWeekHigh":    getattr(fi, "year_high",         None),
+            "fiftyTwoWeekLow":     getattr(fi, "year_low",          None),
+            "marketCap":           getattr(fi, "market_cap",        None),
+            "sharesOutstanding":   getattr(fi, "shares",            None),
             "currency":            getattr(fi, "currency",
                                            "SAR" if ".SR" in symbol else "USD"),
             "shortName": symbol,
         }
+        # One more attempt at full info after fast_info
+        try:
+            t2   = yf.Ticker(symbol)
+            info2 = t2.info
+            if info2 and isinstance(info2, dict) and len(info2) > 10:
+                base.update({k: v for k, v in info2.items() if v is not None})
+        except Exception:
+            pass
+        return base
     except Exception:
         pass
     return {}
@@ -737,6 +759,25 @@ with tab1:
 with tab2:
     fins = fetch_financials(symbol)
     cf   = fins["cashflow"]
+
+    # Check if fundamentals actually loaded
+    has_fundamentals = any(_sf(info.get(k)) for k in [
+        "trailingPE", "forwardPE", "totalRevenue", "profitMargins",
+        "enterpriseToEbitda", "returnOnEquity"
+    ])
+
+    if not has_fundamentals:
+        rc1, rc2 = st.columns([3, 1])
+        with rc1:
+            st.warning(
+                "⚠️ Fundamental data returned N/A — Yahoo Finance may be rate-limiting. "
+                "Wait 15 seconds and click **Refresh Fundamentals** to retry."
+            )
+        with rc2:
+            if st.button("🔄 Refresh Fundamentals"):
+                fetch_info.clear()
+                fetch_financials.clear()
+                st.rerun()
 
     hdr("📊 Valuation")
     v1,v2,v3,v4 = st.columns(4)
