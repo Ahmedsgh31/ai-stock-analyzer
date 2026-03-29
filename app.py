@@ -294,7 +294,7 @@ def _active_provider(keys: dict) -> str:
     if keys["gemini"]:    return "Gemini"
     return None
 
-def _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency):
+def _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency, horizon=30):
     pe      = _num(_sf(info.get("trailingPE")  or info.get("forwardPE")))
     fpe     = _num(_sf(info.get("forwardPE")))
     rev     = _money(_sf(info.get("totalRevenue")))
@@ -317,30 +317,48 @@ def _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency):
     rsi_txt  = f"{rsi_val:.1f}" if rsi_val else "N/A"
     macd_txt = ("Bullish momentum" if (macd_val and macd_val > 0)
                 else "Bearish momentum" if macd_val else "N/A")
-    return f"""You are a senior CFA charterholder and portfolio manager. Provide a professional investment analysis of {name} ({symbol}).
+    return f"""You are a senior CFA charterholder and portfolio manager. Write a complete, detailed investment analysis of {name} ({symbol}). You MUST write all 4 paragraphs in full — do not stop early.
 
-COMPANY: {country} | Sector: {sector} | Currency: {currency}
-Market Cap: {mktcap} | Price: {price} {currency} | Analyst Target: {target} | Consensus: {rec}
+COMPANY DATA:
+- Country: {country} | Sector: {sector} | Currency: {currency}
+- Market Cap: {mktcap} | Current Price: {price} {currency}
+- Analyst Consensus: {rec} | Mean Price Target: {target}
 
-VALUATION: P/E(TTM)={pe} | P/E(Fwd)={fpe} | P/B={pb} | EV/EBITDA={ev_eb}
-FINANCIALS: Revenue={rev} | Gross Margin={gm} | Net Margin={margin} | ROE={roe} | D/E={de} | FCF={fcf}
-TECHNICALS: RSI(14)={rsi_txt} | MACD={macd_txt}
-FORECAST: Ensemble target={fc_end} {currency} | Implied move={upside}
+VALUATION METRICS:
+- P/E (Trailing): {pe} | P/E (Forward): {fpe} | P/B: {pb} | EV/EBITDA: {ev_eb}
 
-Write exactly 4 paragraphs:
-1. BUSINESS OVERVIEW: What does this company do and what is its competitive position?
-2. VALUATION VERDICT: Is it cheap, fair, or expensive vs sector norms? Be specific with numbers.
-3. TECHNICAL & MOMENTUM: What do RSI, MACD, and the price forecast suggest?
-4. RISKS & OPPORTUNITIES: 2 key risks and 2 key catalysts an investor must watch.
+FINANCIAL HEALTH:
+- Revenue: {rev} | Gross Margin: {gm} | Net Margin: {margin}
+- Return on Equity: {roe} | Debt/Equity: {de} | Free Cash Flow: {fcf}
 
-End with one bold **VERDICT** sentence. Be direct and analytical."""
+TECHNICAL SIGNALS:
+- RSI (14): {rsi_txt} — {("overbought" if rsi_val and rsi_val > 70 else "oversold" if rsi_val and rsi_val < 30 else "neutral")}
+- MACD: {macd_txt}
+- Ensemble Forecast ({horizon}d): {fc_end} {currency} | Implied move: {upside}
+
+Write EXACTLY these 4 complete paragraphs — each must be 4-6 sentences minimum:
+
+**1. BUSINESS OVERVIEW**
+Describe what {name} does, its market position, competitive advantages, and why it matters to investors. Include context about its role in the {sector} sector and {country} economy.
+
+**2. VALUATION VERDICT**
+Assess whether the stock is cheap, fairly valued, or expensive. Reference the actual P/E, EV/EBITDA, and P/B numbers above. Compare to typical sector benchmarks. State clearly whether the valuation is attractive for an investor today.
+
+**3. TECHNICAL MOMENTUM & FORECAST**
+Interpret the RSI and MACD signals. Explain what the {horizon}-day ensemble forecast of {fc_end} {currency} ({upside}) suggests. Describe the short-term price momentum and what a trader vs long-term investor should note.
+
+**4. RISKS & OPPORTUNITIES**
+Name and explain exactly 2 key risks (be specific, not generic). Name and explain exactly 2 key catalysts or opportunities that could drive the stock higher. Be specific to this company and sector.
+
+End with a single bold sentence: **VERDICT: [your conclusion]**"""
 
 def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
     keys = get_api_keys()
     if not any(keys.values()):
         return None, "no_key"
 
-    prompt = _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency)
+    h = st.session_state.get("forecast_horizon", 30)
+    prompt = _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency, h)
 
     # ── 1. Claude ────────────────────────────────────────
     if keys["anthropic"]:
@@ -350,7 +368,7 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                 headers={"x-api-key": keys["anthropic"],
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 900,
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 2048,
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=45,
             )
@@ -372,7 +390,7 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {keys['openai']}",
                          "Content-Type": "application/json"},
-                json={"model": "gpt-4o", "max_tokens": 900,
+                json={"model": "gpt-4o", "max_tokens": 2048,
                       "messages": [
                           {"role": "system", "content": "You are a senior CFA charterholder."},
                           {"role": "user",   "content": prompt}]},
@@ -406,11 +424,11 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
                         "generationConfig": {
-                            "maxOutputTokens": 900,
+                            "maxOutputTokens": 2048,
                             "temperature": 0.4,
                         },
                     },
-                    timeout=45,
+                    timeout=60,
                 )
                 d = r.json()
                 if "candidates" in d and d["candidates"]:
@@ -763,6 +781,7 @@ with tab3:
     fh_c, ci_c, ind_c = st.columns([3, 1, 1])
     with fh_c:
         horizon = st.slider("Forecast horizon (trading days)", 7, 90, 30)
+        st.session_state["forecast_horizon"] = horizon
     with ci_c:
         show_ci = st.checkbox("Show CI band", value=True)
     with ind_c:
