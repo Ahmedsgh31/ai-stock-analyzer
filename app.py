@@ -384,15 +384,45 @@ Interpret RSI at {rsi_txt} ({rsi_lbl}) and MACD ({macd_txt}) for near-term direc
     return prompt
 
 
-def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
-    keys = get_api_keys()
-    if not any(keys.values()):
-        return None, "no_key"
+def _call_gemini(keys, prompt_text, max_tokens=4096):
+    """Single Gemini call helper — returns (text, model_name) or (None, error)."""
+    attempts = [
+        ("v1beta", "gemini-2.5-flash"),
+        ("v1beta", "gemini-2.0-flash"),
+        ("v1beta", "gemini-2.5-pro"),
+        ("v1beta", "gemini-2.0-flash-lite"),
+    ]
+    last_err = "unknown"
+    for version, model in attempts:
+        try:
+            url = (f"https://generativelanguage.googleapis.com/"
+                   f"{version}/models/{model}:generateContent"
+                   f"?key={keys['gemini']}")
+            r = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt_text}]}],
+                    "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.4},
+                },
+                timeout=90,
+            )
+            d = r.json()
+            if "candidates" in d and d["candidates"]:
+                text = d["candidates"][0]["content"]["parts"][0]["text"]
+                return text, model
+            last_err = d.get("error", {}).get("message", str(d))
+            skip = ["not found", "not supported", "quota", "limit", "deprecated"]
+            if any(p in last_err.lower() for p in skip):
+                continue
+            return None, f"error: {last_err}"
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, f"all_failed: {last_err[:150]}"
 
-    h = st.session_state.get("forecast_horizon", 30)
-    prompt = _build_prompt(symbol, name, info, fc_df, rsi_val, macd_val, currency, h)
-
-    # ── 1. Claude ────────────────────────────────────────
+def _call_provider(keys, prompt_text, max_tokens=4096):
+    """Try Claude → OpenAI → Gemini. Returns (text, provider_label) or (None, error)."""
     if keys["anthropic"]:
         try:
             r = requests.post(
@@ -400,33 +430,30 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
                 headers={"x-api-key": keys["anthropic"],
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 4096,
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=45,
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": prompt_text}]},
+                timeout=90,
             )
             d = r.json()
             if "content" in d and d["content"]:
                 return d["content"][0]["text"], "Claude"
             err = d.get("error", {}).get("message", "unknown")
-            # If out of credits, fall through to next provider
             if "credit" not in err.lower() and "balance" not in err.lower():
                 return None, f"claude_error: {err}"
-            # else fall through silently
         except Exception as e:
             return None, f"claude_exception: {e}"
 
-    # ── 2. OpenAI ────────────────────────────────────────
     if keys["openai"]:
         try:
             r = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {keys['openai']}",
                          "Content-Type": "application/json"},
-                json={"model": "gpt-4o", "max_tokens": 4096,
+                json={"model": "gpt-4o", "max_tokens": max_tokens,
                       "messages": [
                           {"role": "system", "content": "You are a senior CFA charterholder."},
-                          {"role": "user",   "content": prompt}]},
-                timeout=45,
+                          {"role": "user",   "content": prompt_text}]},
+                timeout=90,
             )
             d = r.json()
             if "choices" in d:
@@ -435,48 +462,48 @@ def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
         except Exception as e:
             return None, f"openai_exception: {e}"
 
-    # ── 3. Google Gemini (FREE tier) ─────────────────────
     if keys["gemini"]:
-        # Use models confirmed available from the account's model list
-        attempts = [
-            ("v1beta", "gemini-2.5-flash"),
-            ("v1beta", "gemini-2.0-flash"),
-            ("v1beta", "gemini-2.5-pro"),
-            ("v1beta", "gemini-2.0-flash-lite"),
-        ]
-        last_err = "unknown"
-        for version, model in attempts:
-            try:
-                url = (f"https://generativelanguage.googleapis.com/"
-                       f"{version}/models/{model}:generateContent"
-                       f"?key={keys['gemini']}")
-                r = requests.post(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "maxOutputTokens": 4096,
-                            "temperature": 0.4,
-                        },
-                    },
-                    timeout=60,
-                )
-                d = r.json()
-                if "candidates" in d and d["candidates"]:
-                    text = d["candidates"][0]["content"]["parts"][0]["text"]
-                    return text, f"Gemini ({model})"
-                last_err = d.get("error", {}).get("message", str(d))
-                skip_phrases = ["not found", "not supported", "quota", "limit", "deprecated"]
-                if any(p in last_err.lower() for p in skip_phrases):
-                    continue
-                return None, f"gemini_error: {last_err}"
-            except Exception as e:
-                last_err = str(e)
-                continue
-        return None, f"gemini_all_failed: {last_err[:200]}"
+        text, model_or_err = _call_gemini(keys, prompt_text, max_tokens)
+        if text:
+            return text, f"Gemini ({model_or_err})"
+        return None, f"gemini_failed: {model_or_err}"
 
     return None, "no_provider"
+
+def get_ai_narrative(symbol, name, info, fc_df, rsi_val, macd_val, currency):
+    keys = get_api_keys()
+    if not any(keys.values()):
+        return None, None, "no_key"
+
+    h = st.session_state.get("forecast_horizon", 30)
+
+    # ── Build English-only prompt ─────────────────────────
+    english_prompt = _build_prompt(
+        symbol, name, info, fc_df, rsi_val, macd_val, currency, h
+    )
+
+    # ── Call 1: English analysis ──────────────────────────
+    english_text, provider = _call_provider(keys, english_prompt, max_tokens=4096)
+    if not english_text:
+        return None, None, provider  # provider holds the error string
+
+    # ── Call 2: Arabic translation (separate call = full tokens) ──
+    arabic_prompt = f"""You are a professional Arabic financial translator.
+Translate the following investment analysis into formal financial Arabic (اللغة المالية الرسمية الفصحى).
+
+Rules:
+- Translate ALL sections completely — do not skip or shorten any section
+- Keep all numbers, ticker symbols, currency codes, and percentages exactly as-is
+- Use correct Arabic financial terminology throughout
+- Maintain all section headers translated into Arabic
+- Start immediately with the header: ## التحليل بالعربية
+
+TEXT TO TRANSLATE:
+{english_text}"""
+
+    arabic_text, _ = _call_provider(keys, arabic_prompt, max_tokens=4096)
+    # Arabic is best-effort — if it fails, we still return the English
+    return english_text, arabic_text, provider
 
 # ════════════════════════════════════════════════════════
 # SIDEBAR
@@ -976,28 +1003,55 @@ Get key: [platform.openai.com](https://platform.openai.com)
             "business overview · valuation verdict · technical momentum · risks & catalysts."
         )
         if st.button(f"🤖 Generate {provider} Analysis", type="primary"):
-            with st.spinner(f"Generating analysis with {provider}…"):
-                narrative, status = get_ai_narrative(
+            # Two-step: English first, then Arabic translation
+            eng_placeholder   = st.empty()
+            arab_placeholder  = st.empty()
+
+            with st.spinner(f"Step 1/2 — Generating English analysis · Step 2/2 — Translating to Arabic… (may take 20-30 seconds)…"):
+                english_text, arabic_text, status = get_ai_narrative(
                     symbol, name, info,
                     st.session_state.get("fc_df"),
                     st.session_state.get("rsi_now"),
                     st.session_state.get("macd_now"),
                     currency,
                 )
-            if narrative:
-                st.markdown("---")
-                st.markdown(narrative)
-                st.markdown("---")
-                st.caption(
-                    f"Generated by {provider} · "
-                    "Educational purposes only · Not financial advice"
-                )
+
+            if english_text:
+                # ── English section ───────────────────────
+                with eng_placeholder.container():
+                    st.markdown("---")
+                    st.markdown(english_text)
+                    st.markdown("---")
+                    st.caption(
+                        f"Generated by {provider} · "
+                        "Educational purposes only · Not financial advice"
+                    )
+
+                # ── Arabic section ────────────────────────
+                if arabic_text:
+                    with arab_placeholder.container():
+                        st.markdown("---")
+                        # RTL styling for Arabic
+                        st.markdown(
+                            '<div dir="rtl" style="text-align:right; '
+                            'font-family: Arial, sans-serif; '
+                            'font-size: 1rem; line-height: 1.9; '
+                            'background: rgba(137,180,250,0.06); '
+                            'border-right: 3px solid #89b4fa; '
+                            'padding: 20px 24px; border-radius: 8px;">'
+                            + arabic_text.replace("\n", "<br>") +
+                            '</div>',
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown("---")
+                        st.caption("الترجمة العربية · للأغراض التعليمية فقط · ليست نصيحة مالية")
+                else:
+                    st.info("Arabic translation was not available this time — English analysis is complete above.")
             else:
-                if "quota" in status.lower() or "limit" in status.lower():
+                if status and ("quota" in status.lower() or "limit" in status.lower()):
                     st.error(
                         "⏳ **Gemini quota temporarily exceeded.**\n\n"
-                        "This usually resolves in a few seconds. "
-                        "**Wait 10 seconds and click Generate again.**\n\n"
+                        "Wait 10 seconds and click Generate again.\n\n"
                         f"Detail: `{status[:150]}`"
                     )
                 else:
